@@ -491,7 +491,7 @@ def _to_bgr_for_vis(image: np.ndarray) -> np.ndarray:
 
     raise ValueError(f"Unsupported image shape: {image.shape}")
 
-# python frontend/optical_features.py
+# python da3_slam/optical_frontend.py
 if __name__ == "__main__":
     processor = OpticalFlowKeyframeProcessor(
         min_feature_distance=10,
