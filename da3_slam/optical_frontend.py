@@ -491,6 +491,7 @@ def _to_bgr_for_vis(image: np.ndarray) -> np.ndarray:
 
     raise ValueError(f"Unsupported image shape: {image.shape}")
 
+
 # python da3_slam/optical_frontend.py
 if __name__ == "__main__":
     processor = OpticalFlowKeyframeProcessor(
@@ -500,6 +501,7 @@ if __name__ == "__main__":
     )
 
     import glob
+
     image_files = glob.glob("data/cam0-20260427T031458Z-3-001/cam0/data/*.png")
     image_files.sort()
 
