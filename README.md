@@ -35,3 +35,20 @@ flowchart LR
     H --> I[Add relative pose / Sim3 edges<br>Pose graph optimization]
     I --> L[Update global keyframe poses<br>Fuse / update map]
 ```
+
+
+
+pose = rotation + translation + scale
+
+
+
+1. Optical-flow frontend edge
+2. DA3 intra-chunk relative pose edge
+3. Optional loop-closure edge
+
+
+
+opencv
+gtsam
+pytest
+tritonclient

@@ -31,6 +31,13 @@ class ImagePosePrior:
 
 
 @dataclass
+class ChunkScalePrior:
+    chunk_id: int
+    scale: float
+    weight: float = 1.0
+
+
+@dataclass
 class PoseGraphOptimizationResult:
     poses: Dict[int, gtsam.Pose3]
     pose_matrices: Dict[int, np.ndarray]
@@ -101,6 +108,7 @@ class DA3ChunkPoseGraphOptimizer:
         self,
         chunks: Sequence[PoseChunk | Dict[str, Any]],
         pose_priors: Optional[Sequence[ImagePosePrior | Dict[str, Any]]] = None,
+        scale_priors: Optional[Sequence[ChunkScalePrior | Dict[str, Any]]] = None,
         fix_first_pose_identity: bool = True,
         fix_first_chunk_scale_one: bool = True,
     ) -> PoseGraphOptimizationResult:
@@ -195,6 +203,24 @@ class DA3ChunkPoseGraphOptimizer:
             )
 
             graph.add(gtsam.PriorFactorPose3(pose_key, prior_pose, prior_noise))
+
+        for prior in scale_priors:
+            chunk_id = int(prior["chunk_id"]) if isinstance(prior, dict) else int(prior.chunk_id)
+            scale = float(prior["scale"]) if isinstance(prior, dict) else float(prior.scale)
+            weight = float(prior.get("weight", 1.0)) if isinstance(prior, dict) else float(prior.weight)
+
+            if scale <= 0 or not np.isfinite(scale):
+                raise ValueError(f"Invalid scale prior for chunk {chunk_id}: {scale}")
+
+            sigma = 1.0 / math.sqrt(weight)
+
+            graph.add(
+                self._make_log_scale_prior_factor(
+                    scale_key=self._scale_key(chunk_id),
+                    target_log_scale=math.log(scale),
+                    sigma=sigma,
+                )
+            )
 
         # Strongly anchor the first image pose to identity if requested.
         if fix_first_pose_identity:
