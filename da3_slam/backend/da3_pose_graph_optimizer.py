@@ -13,6 +13,21 @@ import math
 import numpy as np
 import gtsam
 
+try:
+    from ..logging_utils import configure_logging, get_logger
+except ImportError:
+    try:
+        from logging_utils import configure_logging, get_logger
+    except ImportError:
+        import sys
+        from pathlib import Path
+
+        sys.path.append(str(Path(__file__).resolve().parents[1]))
+        from logging_utils import configure_logging, get_logger
+
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class PoseChunk:
@@ -681,6 +696,8 @@ class DA3ChunkPoseGraphOptimizer:
 
 
 if __name__ == "__main__":
+    configure_logging()
+
     optimizer = DA3ChunkPoseGraphOptimizer(
         input_pose_is_w2c=False,  # set True if DA3 poses are world-to-camera
         relative_rotation_sigma=0.03,
@@ -719,14 +736,13 @@ if __name__ == "__main__":
         fix_first_chunk_scale_one=True,
     )
 
-    print("initial error:", result.initial_error)
-    print("final error:", result.final_error)
+    logger.info("initial error: %s", result.initial_error)
+    logger.info("final error: %s", result.final_error)
 
     optimized_poses = result.pose_matrices
     optimized_scales = result.chunk_scales
 
     for image_id, T in optimized_poses.items():
-        print("image", image_id)
-        print(T)
+        logger.info("image %s\n%s", image_id, T)
 
-    print("chunk scales:", optimized_scales)
+    logger.info("chunk scales: %s", optimized_scales)

@@ -8,6 +8,14 @@ import cv2
 import numpy as np
 import open3d as o3d
 
+try:
+    from .logging_utils import ensure_logging_configured, get_logger
+except ImportError:
+    from logging_utils import ensure_logging_configured, get_logger
+
+
+logger = get_logger(__name__)
+
 
 def build_open3d_tsdf_from_saved_keyframes(
     map_dir: str | Path,
@@ -88,6 +96,9 @@ def build_open3d_tsdf_from_saved_keyframes(
             Dictionary with integration statistics.
     """
 
+    if verbose:
+        ensure_logging_configured()
+
     map_dir = Path(map_dir)
     manifest_path = map_dir / "manifest.json"
     keyframe_dir = map_dir / "keyframes"
@@ -105,7 +116,7 @@ def build_open3d_tsdf_from_saved_keyframes(
     )
 
     if verbose:
-        print(f"[TSDF] selected keyframes: {len(selected_keyframe_ids)}")
+        logger.info("[TSDF] selected keyframes: %s", len(selected_keyframe_ids))
 
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=float(voxel_length),
@@ -130,7 +141,7 @@ def build_open3d_tsdf_from_saved_keyframes(
         except Exception as e:
             skipped.append((image_id, str(e)))
             if verbose:
-                print(f"[TSDF][skip] kf {image_id}: {e}")
+                logger.warning("[TSDF][skip] kf %s: %s", image_id, e)
             continue
 
         h, w = depth.shape[:2]
@@ -169,10 +180,10 @@ def build_open3d_tsdf_from_saved_keyframes(
         integrated_ids.append(image_id)
 
         if verbose and len(integrated_ids) % 10 == 0:
-            print(f"[TSDF] integrated {len(integrated_ids)} frames")
+            logger.info("[TSDF] integrated %s frames", len(integrated_ids))
 
     if verbose:
-        print(f"[TSDF] extracting mesh and point cloud...")
+        logger.info("[TSDF] extracting mesh and point cloud...")
 
     mesh = volume.extract_triangle_mesh()
     mesh.compute_vertex_normals()
@@ -184,14 +195,14 @@ def build_open3d_tsdf_from_saved_keyframes(
         output_mesh_path.parent.mkdir(parents=True, exist_ok=True)
         o3d.io.write_triangle_mesh(str(output_mesh_path), mesh)
         if verbose:
-            print(f"[TSDF] saved mesh: {output_mesh_path}")
+            logger.info("[TSDF] saved mesh: %s", output_mesh_path)
 
     if output_pcd_path is not None:
         output_pcd_path = Path(output_pcd_path)
         output_pcd_path.parent.mkdir(parents=True, exist_ok=True)
         o3d.io.write_point_cloud(str(output_pcd_path), pcd)
         if verbose:
-            print(f"[TSDF] saved point cloud: {output_pcd_path}")
+            logger.info("[TSDF] saved point cloud: %s", output_pcd_path)
 
     stats = {
         "map_dir": str(map_dir),

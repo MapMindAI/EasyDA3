@@ -37,18 +37,9 @@ flowchart LR
 ```
 
 
-
-pose = rotation + translation + scale
-
-
-
-1. Optical-flow frontend edge
-2. DA3 intra-chunk relative pose edge
-3. Optional loop-closure edge
-
-
-
+pip dependences:
 opencv
 gtsam
 pytest
 tritonclient
+logging

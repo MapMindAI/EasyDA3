@@ -3,11 +3,19 @@ import numpy as np
 import cv2
 import time
 
+try:
+    from .logging_utils import configure_logging, get_logger
+except ImportError:
+    from logging_utils import configure_logging, get_logger
+
+
+logger = get_logger(__name__)
+
 
 def list_all_triton_models(client):
     model_index = client.get_model_repository_index()
     for model in model_index.models:
-        print(f"Model: {model.name}, Version: {model.version}, State: {model.state}")
+        logger.info("Model: %s, Version: %s, State: %s", model.name, model.version, model.state)
 
 
 def find_triton_model(client, model_key):
@@ -213,7 +221,7 @@ class DepthAnything3:
         self.expected_num_images = expected_num_images
         self.input_name = input_name
 
-        print(f"Start {self.model_name} from {triton_url}")
+        logger.info("Start %s from %s", self.model_name, triton_url)
 
         self.desired_outputs = [
             grpcclient.InferRequestedOutput("depth"),
@@ -381,10 +389,12 @@ class DepthAnything3:
             save_path = f"{prefix}_{i}.png"
             depth_u8 = (np.clip(depth_i_vis, 0, 1) * 255).astype(np.uint8)
             cv2.imwrite(save_path, depth_u8)
-            print(f"Saved {save_path}")
+            logger.info("Saved %s", save_path)
 
 
 if __name__ == "__main__":
+    configure_logging()
+
     da3 = DepthAnything3(
         triton_url="0.0.0.0:8001",
         expected_num_images=None,
@@ -399,11 +409,11 @@ if __name__ == "__main__":
     time_ms_begin = time.time() * 1000
     result, images = da3.run_paths(image_paths)
     time_ms_end = time.time() * 1000
-    print(f"DA3 used {time_ms_end - time_ms_begin}ms")
+    logger.info("DA3 used %.3fms", time_ms_end - time_ms_begin)
 
     da3.save_visualizations(result, prefix="data/depth")
 
-    print("Generating point cloud to file")
+    logger.info("Generating point cloud to file")
     points, colors = merge_rgbd_to_pointcloud_numpy(
         depth_list=result["depth_list"],
         intrinsics_list=result["intrinsics_list"],

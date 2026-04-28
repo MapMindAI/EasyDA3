@@ -10,6 +10,14 @@ import cv2
 import numpy as np
 from dataclasses import dataclass
 
+try:
+    from .logging_utils import configure_logging, get_logger
+except ImportError:
+    from logging_utils import configure_logging, get_logger
+
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class OpticalFlowResult:
@@ -494,6 +502,8 @@ def _to_bgr_for_vis(image: np.ndarray) -> np.ndarray:
 
 # python da3_slam/optical_frontend.py
 if __name__ == "__main__":
+    configure_logging()
+
     processor = OpticalFlowKeyframeProcessor(
         min_feature_distance=10,
         keyframe_pixel_threshold=25.0,
@@ -510,10 +520,11 @@ if __name__ == "__main__":
         result = processor.process(image)
 
         if result.is_keyframe:
-            print(
-                f"New keyframe at frame {result.frame_id}, "
-                f"tracked points = {result.num_tracks}, "
-                f"median motion = {result.median_pixel_motion:.2f}px"
+            logger.info(
+                "New keyframe at frame %s, tracked points = %s, median motion = %.2fpx",
+                result.frame_id,
+                result.num_tracks,
+                result.median_pixel_motion,
             )
         # tracks[:, 0:2] are feature positions in the last keyframe
         # tracks[:, 2:4] are corresponding feature positions in current frame
