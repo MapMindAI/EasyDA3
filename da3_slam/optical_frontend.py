@@ -9,6 +9,7 @@
 import cv2
 import numpy as np
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
 try:
     from .logging_utils import configure_logging, get_logger
@@ -17,6 +18,43 @@ except ImportError:
 
 
 logger = get_logger(__name__)
+
+
+OPTICAL_FLOW_THRESHOLD_PRESETS = {
+    "tight": {
+        "max_features": 1200,
+        "min_feature_distance": 6,
+        "keyframe_pixel_threshold": 18.0,
+        "keyframe_radial_scale_threshold": 0.04,
+        "min_tracked_features": 220,
+        "min_radial_scale_tracks": 30,
+        "radial_scale_min_radius": 20.0,
+        "feature_replenish_radius": 8,
+    },
+    "mediate": {
+        "max_features": 1000,
+        "min_feature_distance": 8,
+        "keyframe_pixel_threshold": 35.0,
+        "keyframe_radial_scale_threshold": 0.08,
+        "min_tracked_features": 150,
+        "min_radial_scale_tracks": 30,
+        "radial_scale_min_radius": 20.0,
+        "feature_replenish_radius": 10,
+    },
+    "loose": {
+        "max_features": 800,
+        "min_feature_distance": 10,
+        "keyframe_pixel_threshold": 60.0,
+        "keyframe_radial_scale_threshold": 0.12,
+        "min_tracked_features": 100,
+        "min_radial_scale_tracks": 25,
+        "radial_scale_min_radius": 20.0,
+        "feature_replenish_radius": 12,
+    },
+}
+
+OPTICAL_FLOW_THRESHOLD_PRESETS["medium"] = OPTICAL_FLOW_THRESHOLD_PRESETS["mediate"]
+OPTICAL_FLOW_THRESHOLD_PRESETS["moderate"] = OPTICAL_FLOW_THRESHOLD_PRESETS["mediate"]
 
 
 @dataclass
@@ -28,6 +66,10 @@ class OpticalFlowResult:
     mean_pixel_motion: float
     frame_id: int
     keyframe_id: int
+    median_radial_scale_change: float = 0.0
+    mean_radial_scale_change: float = 0.0
+    keyframe_reason: str = ""
+    num_new_features: int = 0
 
 
 class OpticalFlowKeyframeProcessor:
@@ -38,7 +80,11 @@ class OpticalFlowKeyframeProcessor:
         quality_level: float = 0.01,
         block_size: int = 7,
         keyframe_pixel_threshold: float = 25.0,
+        keyframe_radial_scale_threshold: float = 0.08,
         min_tracked_features: int = 150,
+        min_radial_scale_tracks: int = 30,
+        radial_scale_min_radius: float = 20.0,
+        feature_replenish_radius=None,
         lk_win_size=(21, 21),
         lk_max_level: int = 3,
         lk_max_iter: int = 30,
@@ -66,8 +112,27 @@ class OpticalFlowKeyframeProcessor:
                 If median feature motion from the last keyframe to current frame
                 is larger than this, the current frame becomes a new keyframe.
 
+            keyframe_radial_scale_threshold:
+                If the median absolute log radial-scale change is larger than
+                this, the current frame becomes a new keyframe. This catches
+                forward/backward camera motion where absolute pixel movement can
+                stay small.
+
             min_tracked_features:
                 If tracked feature count drops below this number, force a new keyframe.
+
+            min_radial_scale_tracks:
+                Minimum number of off-center tracks required before using the
+                radial-scale keyframe cue.
+
+            radial_scale_min_radius:
+                Ignore features closer than this many pixels to the image
+                center when computing radial scale, because their ratio is noisy.
+
+            feature_replenish_radius:
+                Suppression radius around existing tracks when adding new
+                features in blank areas after a keyframe promotion. Defaults to
+                min_feature_distance.
 
             lk_win_size:
                 Lucas-Kanade optical flow window size.
@@ -88,10 +153,16 @@ class OpticalFlowKeyframeProcessor:
                 Maximum allowed forward-backward tracking error in pixels.
         """
 
+        self.max_features = int(max_features)
+        self.min_feature_distance = int(min_feature_distance)
+        self.feature_replenish_radius = (
+            self.min_feature_distance if feature_replenish_radius is None else int(feature_replenish_radius)
+        )
+
         self.feature_params = dict(
-            maxCorners=max_features,
+            maxCorners=self.max_features,
             qualityLevel=quality_level,
-            minDistance=min_feature_distance,
+            minDistance=self.min_feature_distance,
             blockSize=block_size,
         )
 
@@ -105,10 +176,13 @@ class OpticalFlowKeyframeProcessor:
             ),
         )
 
-        self.keyframe_pixel_threshold = keyframe_pixel_threshold
-        self.min_tracked_features = min_tracked_features
-        self.use_forward_backward_check = use_forward_backward_check
-        self.forward_backward_threshold = forward_backward_threshold
+        self.keyframe_pixel_threshold = float(keyframe_pixel_threshold)
+        self.keyframe_radial_scale_threshold = float(keyframe_radial_scale_threshold)
+        self.min_tracked_features = int(min_tracked_features)
+        self.min_radial_scale_tracks = int(min_radial_scale_tracks)
+        self.radial_scale_min_radius = float(radial_scale_min_radius)
+        self.use_forward_backward_check = bool(use_forward_backward_check)
+        self.forward_backward_threshold = float(forward_backward_threshold)
 
         self.initialized = False
 
@@ -161,6 +235,8 @@ class OpticalFlowKeyframeProcessor:
                 mean_pixel_motion=0.0,
                 frame_id=self.frame_id,
                 keyframe_id=self.keyframe_id,
+                keyframe_reason="initial",
+                num_new_features=len(self.keyframe_points),
             )
 
         if gray.shape != self.image_shape:
@@ -170,7 +246,7 @@ class OpticalFlowKeyframeProcessor:
             )
 
         if self.last_points is None or len(self.last_points) == 0:
-            self._set_new_keyframe(gray)
+            num_new_features = self._set_new_keyframe(gray)
 
             return OpticalFlowResult(
                 is_keyframe=True,
@@ -180,6 +256,8 @@ class OpticalFlowKeyframeProcessor:
                 mean_pixel_motion=0.0,
                 frame_id=self.frame_id,
                 keyframe_id=self.keyframe_id,
+                keyframe_reason="no_tracks",
+                num_new_features=num_new_features,
             )
 
         prev_pts = self.last_points.reshape(-1, 1, 2).astype(np.float32)
@@ -193,7 +271,7 @@ class OpticalFlowKeyframeProcessor:
         )
 
         if next_pts is None or status is None:
-            self._set_new_keyframe(gray)
+            num_new_features = self._set_new_keyframe(gray)
 
             return OpticalFlowResult(
                 is_keyframe=True,
@@ -203,6 +281,8 @@ class OpticalFlowKeyframeProcessor:
                 mean_pixel_motion=0.0,
                 frame_id=self.frame_id,
                 keyframe_id=self.keyframe_id,
+                keyframe_reason="tracking_failed",
+                num_new_features=num_new_features,
             )
 
         status = status.reshape(-1).astype(bool)
@@ -245,14 +325,29 @@ class OpticalFlowKeyframeProcessor:
             median_motion = 0.0
             mean_motion = 0.0
 
-        is_keyframe = median_motion >= self.keyframe_pixel_threshold or num_tracks < self.min_tracked_features
+        median_radial_scale_change, mean_radial_scale_change = self._compute_radial_scale_change(
+            key_pts_valid,
+            cur_pts_valid,
+        )
+
+        keyframe_reasons = []
+        if median_motion >= self.keyframe_pixel_threshold:
+            keyframe_reasons.append("pixel_motion")
+        if median_radial_scale_change >= self.keyframe_radial_scale_threshold:
+            keyframe_reasons.append("radial_scale")
+        if num_tracks < self.min_tracked_features:
+            keyframe_reasons.append("track_count")
+
+        is_keyframe = len(keyframe_reasons) > 0
+        num_new_features = 0
 
         if is_keyframe:
             # Important:
             # The output tracks are still with respect to the previous keyframe.
-            # After producing the result, we promote the current frame to new keyframe.
+            # Surviving tracks become seed features in the new keyframe; only
+            # uncovered image areas are searched for supplemental features.
             old_keyframe_id = self.keyframe_id
-            self._set_new_keyframe(gray)
+            num_new_features = self._set_new_keyframe(gray, seed_points=cur_pts_valid)
 
             result_keyframe_id = old_keyframe_id
         else:
@@ -271,6 +366,10 @@ class OpticalFlowKeyframeProcessor:
             mean_pixel_motion=mean_motion,
             frame_id=self.frame_id,
             keyframe_id=result_keyframe_id,
+            median_radial_scale_change=median_radial_scale_change,
+            mean_radial_scale_change=mean_radial_scale_change,
+            keyframe_reason="+".join(keyframe_reasons),
+            num_new_features=num_new_features,
         )
 
     def _initialize(self, gray: np.ndarray):
@@ -278,24 +377,96 @@ class OpticalFlowKeyframeProcessor:
         self.initialized = True
         self._set_new_keyframe(gray)
 
-    def _set_new_keyframe(self, gray: np.ndarray):
+    def _set_new_keyframe(self, gray: np.ndarray, seed_points: Optional[np.ndarray] = None) -> int:
         self.keyframe_gray = gray
         self.last_gray = gray
 
         self.keyframe_id = self.frame_id
 
-        pts = self._detect_features(gray)
+        if seed_points is None or len(seed_points) == 0:
+            pts = self._detect_features(gray)
+            num_new_features = len(pts)
+        else:
+            seed_points = self._filter_points_in_bounds(seed_points, gray.shape)
+            pts, num_new_features = self._replenish_features(gray, seed_points)
 
         self.keyframe_points = pts
         self.last_points = pts.copy()
 
-    def _detect_features(self, gray: np.ndarray) -> np.ndarray:
-        pts = cv2.goodFeaturesToTrack(gray, mask=None, **self.feature_params)
+        return num_new_features
+
+    def _detect_features(self, gray: np.ndarray, mask=None, max_features=None) -> np.ndarray:
+        feature_params = self.feature_params.copy()
+        if max_features is not None:
+            feature_params["maxCorners"] = int(max_features)
+
+        pts = cv2.goodFeaturesToTrack(gray, mask=mask, **feature_params)
 
         if pts is None:
             return np.empty((0, 2), dtype=np.float32)
 
         return pts.reshape(-1, 2).astype(np.float32)
+
+    def _replenish_features(self, gray: np.ndarray, seed_points: np.ndarray) -> Tuple[np.ndarray, int]:
+        if len(seed_points) >= self.max_features:
+            return seed_points[: self.max_features].astype(np.float32), 0
+
+        mask = self._make_blank_area_mask(gray.shape, seed_points)
+        max_new_features = self.max_features - len(seed_points)
+        new_points = self._detect_features(gray, mask=mask, max_features=max_new_features)
+
+        if len(new_points) == 0:
+            return seed_points.astype(np.float32), 0
+
+        pts = np.vstack([seed_points, new_points]).astype(np.float32)
+        return pts, len(new_points)
+
+    def _make_blank_area_mask(self, image_shape, existing_points: np.ndarray) -> np.ndarray:
+        height, width = image_shape[:2]
+        mask = np.full((height, width), 255, dtype=np.uint8)
+
+        radius = max(1, int(self.feature_replenish_radius))
+        for point in existing_points:
+            x, y = point
+            cv2.circle(mask, (int(round(x)), int(round(y))), radius, 0, thickness=-1)
+
+        return mask
+
+    @staticmethod
+    def _filter_points_in_bounds(points: np.ndarray, image_shape) -> np.ndarray:
+        if points is None or len(points) == 0:
+            return np.empty((0, 2), dtype=np.float32)
+
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+        height, width = image_shape[:2]
+        valid = (
+            np.isfinite(points[:, 0])
+            & np.isfinite(points[:, 1])
+            & (points[:, 0] >= 0)
+            & (points[:, 0] < width)
+            & (points[:, 1] >= 0)
+            & (points[:, 1] < height)
+        )
+
+        return points[valid].astype(np.float32)
+
+    def _compute_radial_scale_change(self, key_points: np.ndarray, current_points: np.ndarray):
+        if len(key_points) < self.min_radial_scale_tracks:
+            return 0.0, 0.0
+
+        height, width = self.image_shape
+        center = np.array([(width - 1) * 0.5, (height - 1) * 0.5], dtype=np.float32)
+
+        key_radius = np.linalg.norm(key_points - center, axis=1)
+        current_radius = np.linalg.norm(current_points - center, axis=1)
+        valid = key_radius >= self.radial_scale_min_radius
+
+        if int(np.count_nonzero(valid)) < self.min_radial_scale_tracks:
+            return 0.0, 0.0
+
+        log_scale_change = np.abs(np.log((current_radius[valid] + 1e-6) / (key_radius[valid] + 1e-6)))
+
+        return float(np.median(log_scale_change)), float(np.mean(log_scale_change))
 
     @staticmethod
     def _to_gray(image: np.ndarray) -> np.ndarray:
@@ -314,6 +485,32 @@ class OpticalFlowKeyframeProcessor:
             gray = np.clip(gray, 0, 255).astype(np.uint8)
 
         return gray
+
+
+def create_optical_flow_processor(threshold: str = "mediate", **overrides) -> OpticalFlowKeyframeProcessor:
+    """
+    Create an OpticalFlowKeyframeProcessor from a compact threshold preset.
+
+    Args:
+        threshold:
+            One of:
+                "tight"   - more keyframes, lower motion/scale thresholds.
+                "mediate" - balanced default. "medium" and "moderate" are aliases.
+                "loose"   - fewer keyframes, higher motion/scale thresholds.
+
+        **overrides:
+            Optional OpticalFlowKeyframeProcessor keyword overrides.
+    """
+
+    preset_name = str(threshold).lower()
+    if preset_name not in OPTICAL_FLOW_THRESHOLD_PRESETS:
+        valid = ", ".join(sorted(OPTICAL_FLOW_THRESHOLD_PRESETS.keys()))
+        raise ValueError(f"Unknown optical-flow threshold preset '{threshold}'. Expected one of: {valid}")
+
+    params = OPTICAL_FLOW_THRESHOLD_PRESETS[preset_name].copy()
+    params.update(overrides)
+
+    return OpticalFlowKeyframeProcessor(**params)
 
 
 def visualize_optical_flow_result(
@@ -418,8 +615,9 @@ def visualize_optical_flow_result(
     if draw_text:
         text_1 = f"tracks: {len(tracks)}"
         text_2 = f"median motion: {result.median_pixel_motion:.2f}px"
-        text_3 = f"keyframe: {result.is_keyframe}"
-        text_4 = f"frame: {result.frame_id}, ref kf: {result.keyframe_id}"
+        text_3 = f"radial scale: {result.median_radial_scale_change:.3f}"
+        text_4 = f"keyframe: {result.is_keyframe} {result.keyframe_reason}"
+        text_5 = f"frame: {result.frame_id}, ref kf: {result.keyframe_id}"
 
         cv2.putText(
             vis,
@@ -449,7 +647,7 @@ def visualize_optical_flow_result(
             (20, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
-            (0, 255, 0) if result.is_keyframe else (255, 255, 255),
+            (255, 255, 255),
             2,
             cv2.LINE_AA,
         )
@@ -458,6 +656,17 @@ def visualize_optical_flow_result(
             vis,
             text_4,
             (20, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0) if result.is_keyframe else (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            vis,
+            text_5,
+            (20, 150),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             (255, 255, 255),
@@ -504,11 +713,7 @@ def _to_bgr_for_vis(image: np.ndarray) -> np.ndarray:
 if __name__ == "__main__":
     configure_logging()
 
-    processor = OpticalFlowKeyframeProcessor(
-        min_feature_distance=10,
-        keyframe_pixel_threshold=25.0,
-        min_tracked_features=150,
-    )
+    processor = create_optical_flow_processor("mediate")
 
     import glob
 
@@ -521,10 +726,14 @@ if __name__ == "__main__":
 
         if result.is_keyframe:
             logger.info(
-                "New keyframe at frame %s, tracked points = %s, median motion = %.2fpx",
+                "New keyframe at frame %s, reason=%s, tracks=%s, "
+                "median motion=%.2fpx, radial scale=%.3f, new features=%s",
                 result.frame_id,
+                result.keyframe_reason,
                 result.num_tracks,
                 result.median_pixel_motion,
+                result.median_radial_scale_change,
+                result.num_new_features,
             )
         # tracks[:, 0:2] are feature positions in the last keyframe
         # tracks[:, 2:4] are corresponding feature positions in current frame

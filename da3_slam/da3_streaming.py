@@ -6,7 +6,11 @@ try:
     from .backend.da3_pose_graph_optimizer import DA3ChunkPoseGraphOptimizer
     from .da3_client import DepthAnything3
     from .logging_utils import configure_logging, get_logger
-    from .optical_frontend import OpticalFlowKeyframeProcessor, visualize_optical_flow_result
+    from .optical_frontend import (
+        OpticalFlowKeyframeProcessor,
+        create_optical_flow_processor,
+        visualize_optical_flow_result,
+    )
     from .streaming import (
         DA3BackendJob,
         DA3BackendResult,
@@ -20,7 +24,11 @@ except ImportError:
     from backend.da3_pose_graph_optimizer import DA3ChunkPoseGraphOptimizer
     from da3_client import DepthAnything3
     from logging_utils import configure_logging, get_logger
-    from optical_frontend import OpticalFlowKeyframeProcessor, visualize_optical_flow_result
+    from optical_frontend import (
+        OpticalFlowKeyframeProcessor,
+        create_optical_flow_processor,
+        visualize_optical_flow_result,
+    )
     from streaming import (
         DA3BackendJob,
         DA3BackendResult,
@@ -41,15 +49,13 @@ __all__ = [
     "DA3StreamingMappingPipeline",
     "KeyframeRecord",
     "MappingProcessResult",
+    "OpticalFlowKeyframeProcessor",
+    "create_optical_flow_processor",
 ]
 
 
 def build_default_pipeline() -> DA3StreamingMappingPipeline:
-    flow_processor = OpticalFlowKeyframeProcessor(
-        min_feature_distance=10,
-        keyframe_pixel_threshold=50.0,
-        min_tracked_features=150,
-    )
+    flow_processor = create_optical_flow_processor("loose")
 
     da3_client = DepthAnything3(
         triton_url="0.0.0.0:8001",
