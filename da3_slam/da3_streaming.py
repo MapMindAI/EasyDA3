@@ -4,10 +4,11 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections import deque
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Set, List, Optional, Sequence
 
 import cv2
 import numpy as np
+import threading
 
 from optical_frontend import (
     OpticalFlowKeyframeProcessor,
@@ -20,6 +21,7 @@ from backend.da3_pose_graph_optimizer import (
     PoseChunk,
     ImagePosePrior,
 )
+from visualizer import MatplotlibTrajectoryVisualizer
 
 
 @dataclass
@@ -135,6 +137,7 @@ class DA3StreamingMappingPipeline:
         if optimizer_num_chunks < 1:
             raise ValueError("optimizer_num_chunks must be >= 1")
 
+        self.state_lock = threading.Lock()
         self.flow_processor = flow_processor
         self.da3_client = da3_client
         self.optimizer = pose_graph_optimizer
@@ -168,6 +171,7 @@ class DA3StreamingMappingPipeline:
         # Global optimized results.
         self.optimized_pose_c2w: Dict[int, np.ndarray] = {}
         self.optimized_chunk_scales: Dict[int, float] = {}
+        self.updated_keyframes: Set[int] = set()
 
     def _sanitize_chunk_scale(self, scale: float, default: float = 1.0) -> float:
         scale = float(scale)
@@ -315,21 +319,23 @@ class DA3StreamingMappingPipeline:
             return []
 
         chunks_to_optimize = self.chunks[-self.optimizer_num_chunks :]
-
-        pose_chunks = [self._chunk_record_to_pose_chunk(c) for c in chunks_to_optimize]
-
         anchor_chunk = chunks_to_optimize[0]
 
-        pose_priors = self._make_anchor_pose_priors(anchor_chunk)
+        # add poses
+        pose_chunks = [self._chunk_record_to_pose_chunk(c) for c in chunks_to_optimize]
+
+        # add priors
+        # pose_priors = self._make_anchor_pose_priors(anchor_chunk)
         scale_priors = []
+        pose_priors = []
 
         is_first_optimization = len(self.optimized_pose_c2w) == 0
-
+        fix_first_pose_identity = True
         if is_first_optimization:
             # First ever local map:
             #   first image pose = identity
             #   first chunk scale = 1
-            fix_first_pose_identity = True
+            # fix_first_pose_identity = True
             fix_first_chunk_scale_one = True
         else:
             # Later local maps:
@@ -337,7 +343,7 @@ class DA3StreamingMappingPipeline:
             #
             # The scale of the anchor chunk is effectively fixed because all
             # poses inside that chunk are strongly constrained by priors.
-            fix_first_pose_identity = False
+            # fix_first_pose_identity = False
             fix_first_chunk_scale_one = False
             anchor_scale = self._sanitize_chunk_scale(anchor_chunk.scale, default=1.0)
 
@@ -359,6 +365,10 @@ class DA3StreamingMappingPipeline:
                 }
             )
 
+        local2world = anchor_chunk.extrinsics_list[0]
+        if anchor_chunk.image_ids[0] in self.optimized_pose_c2w:
+            local2world = self.optimized_pose_c2w[anchor_chunk.image_ids[0]]
+
         result = self.optimizer.optimize(
             chunks=pose_chunks,
             pose_priors=pose_priors,
@@ -369,16 +379,23 @@ class DA3StreamingMappingPipeline:
 
         optimized_image_ids = sorted(result.pose_matrices.keys())
 
-        for image_id, pose_c2w in result.pose_matrices.items():
-            pose_c2w = np.asarray(pose_c2w, dtype=np.float64)
-            pose_w2c = np.linalg.inv(pose_c2w)
+        with self.state_lock:
+            for image_id, pose_c2l in result.pose_matrices.items():
+                image_id = int(image_id)
+                # convert the pose to world coordinate
+                # print(image_id, pose_c2w)
+                self.updated_keyframes.add(image_id)
 
-            self.optimized_pose_c2w[int(image_id)] = pose_c2w
+                pose_c2l = np.asarray(pose_c2l, dtype=np.float64)
+                pose_c2w = np.dot(local2world, pose_c2l)
+                pose_w2c = np.linalg.inv(pose_c2w)
 
-            if int(image_id) in self.keyframes:
-                kf = self.keyframes[int(image_id)]
-                kf.pose_c2w = pose_c2w
-                kf.pose_w2c = pose_w2c
+                self.optimized_pose_c2w[image_id] = pose_c2w
+
+                if int(image_id) in self.keyframes:
+                    kf = self.keyframes[image_id]
+                    kf.pose_c2w = pose_c2w
+                    kf.pose_w2c = pose_w2c
 
         for chunk in chunks_to_optimize:
             if chunk.chunk_id in result.chunk_scales:
@@ -391,10 +408,11 @@ class DA3StreamingMappingPipeline:
 
     def _chunk_record_to_pose_chunk(self, chunk: DA3ChunkRecord):
         scale = float(chunk.scale)
+        if chunk.chunk_id in self.optimized_chunk_scales:
+            scale = self.optimized_chunk_scales[chunk.chunk_id]
         if not np.isfinite(scale) or scale <= 1e-4:
             print(f"[WARN] Chunk {chunk.chunk_id} has invalid scale {scale}, " "resetting to 1.0")
             scale = 1.0
-        # print(f"{chunk.chunk_id} {scale}")
 
         return PoseChunk(
             chunk_id=chunk.chunk_id,
@@ -421,6 +439,17 @@ class DA3StreamingMappingPipeline:
 
         return priors
 
+    def get_trajectory_snapshot(self):
+        with self.state_lock:
+            return {
+                "poses_c2w": {
+                    int(k): np.asarray(v, dtype=np.float64).copy() for k, v in self.optimized_pose_c2w.items()
+                },
+                "frame_id": int(self.frame_id),
+                "latest_keyframe_id": int(self.next_keyframe_id - 1) if self.next_keyframe_id > 0 else None,
+                "latest_chunk_id": int(self.chunks[-1].chunk_id) if len(self.chunks) > 0 else None,
+            }
+
     # ---------------------------------------------------------------------
     # Saving
     # ---------------------------------------------------------------------
@@ -432,6 +461,11 @@ class DA3StreamingMappingPipeline:
     def _save_all_complete_keyframes(self):
         for kf in self.keyframes.values():
             self._save_keyframe(kf)
+
+    def _save_current_keyframes(self):
+        for kf in self.updated_keyframes:
+            self._save_keyframe(kf)
+        self.updated_keyframes.clear()
 
     def _save_keyframe(self, kf: KeyframeRecord):
         self._save_keyframe_rgb(kf)
@@ -604,7 +638,7 @@ class DA3StreamingMappingPipeline:
 if __name__ == "__main__":
     flow_processor = OpticalFlowKeyframeProcessor(
         min_feature_distance=10,
-        keyframe_pixel_threshold=25.0,
+        keyframe_pixel_threshold=50.0,
         min_tracked_features=150,
     )
 
@@ -627,8 +661,22 @@ if __name__ == "__main__":
         output_dir="output_da3_map",
         window_size=10,  # N
         da3_stride_new_keyframes=5,  # M
-        optimizer_num_chunks=5,  # K
+        optimizer_num_chunks=3,  # K
     )
+
+    traj_vis = MatplotlibTrajectoryVisualizer(
+        mode="3d",
+        update_hz=5.0,
+        window_title="DA3-SLAM 3D Trajectory",
+        draw_camera_direction=True,
+    )
+    # traj_vis = MatplotlibTrajectoryVisualizer(
+    #     mode="2d",
+    #     plane="xz",
+    #     update_hz=5.0,
+    #     window_title="DA3-SLAM Top View",
+    # )
+    traj_vis.start()
 
     import glob
 
@@ -639,6 +687,8 @@ if __name__ == "__main__":
         image = cv2.imread(image_file)
 
         result = pipeline.process_image(image)
+        # Update trajectory window
+        traj_vis.update_from_pipeline(pipeline)
 
         if result.is_keyframe:
             print(f"New keyframe: {result.keyframe_id}")
@@ -652,8 +702,9 @@ if __name__ == "__main__":
         vis = visualize_optical_flow_result(image, result.flow_result)
 
         cv2.imshow("optical flow tracks", vis)
-        key = cv2.waitKey(10) & 0xFF
+        key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break
 
     cv2.destroyAllWindows()
+    traj_vis.stop()
