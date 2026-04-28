@@ -19,7 +19,7 @@ try:
         KeyframeRecord,
         MappingProcessResult,
     )
-    from .visualizer import MatplotlibTrajectoryVisualizer
+    from .visualizer import Open3DTrajectoryVisualizer
 except ImportError:
     from backend.da3_pose_graph_optimizer import DA3ChunkPoseGraphOptimizer
     from da3_client import DepthAnything3
@@ -37,7 +37,7 @@ except ImportError:
         KeyframeRecord,
         MappingProcessResult,
     )
-    from visualizer import MatplotlibTrajectoryVisualizer
+    from visualizer import Open3DTrajectoryVisualizer
 
 
 logger = get_logger(__name__)
@@ -85,11 +85,10 @@ def main() -> None:
 
     pipeline = build_default_pipeline()
 
-    traj_vis = MatplotlibTrajectoryVisualizer(
-        mode="3d",
+    traj_vis = Open3DTrajectoryVisualizer(
         update_hz=5.0,
-        window_title="DA3-SLAM 3D Trajectory",
-        draw_camera_direction=True,
+        window_title="DA3-SLAM Open3D Trajectory",
+        camera_size=0.25,
     )
     traj_vis.start()
 
