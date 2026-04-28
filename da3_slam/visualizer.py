@@ -188,7 +188,7 @@ class Open3DTrajectoryVisualizer:
             self._set_lineset(self._history_cameras, np.empty((0, 3)), np.empty((0, 2), dtype=np.int32), [])
             return
 
-        selected = poses_c2w[:-1:self.draw_history_camera_stride]
+        selected = poses_c2w[: -1 : self.draw_history_camera_stride]
         if not selected:
             self._set_lineset(self._history_cameras, np.empty((0, 3)), np.empty((0, 2), dtype=np.int32), [])
             return

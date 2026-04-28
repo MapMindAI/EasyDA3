@@ -9,7 +9,6 @@ from .records import (
     MappingProcessResult,
 )
 
-
 __all__ = [
     "DA3BackendJob",
     "DA3BackendResult",

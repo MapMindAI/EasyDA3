@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 
-
 _RESET = "\033[0m"
 _LEVEL_COLORS = {
     logging.DEBUG: "\033[36m",

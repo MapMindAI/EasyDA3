@@ -109,9 +109,7 @@ class StreamingMapStorage:
                     "has_pose": keyframe.pose_c2w is not None,
                     "rgb_path": f"keyframes/kf_{keyframe.image_id:06d}_rgb.png",
                     "depth_path": (
-                        f"keyframes/kf_{keyframe.image_id:06d}_depth.npy"
-                        if keyframe.depth is not None
-                        else None
+                        f"keyframes/kf_{keyframe.image_id:06d}_depth.npy" if keyframe.depth is not None else None
                     ),
                     "intrinsics_path": (
                         f"keyframes/kf_{keyframe.image_id:06d}_intrinsics.npy"
@@ -119,14 +117,10 @@ class StreamingMapStorage:
                         else None
                     ),
                     "pose_c2w_path": (
-                        f"keyframes/kf_{keyframe.image_id:06d}_pose_c2w.npy"
-                        if keyframe.pose_c2w is not None
-                        else None
+                        f"keyframes/kf_{keyframe.image_id:06d}_pose_c2w.npy" if keyframe.pose_c2w is not None else None
                     ),
                     "pose_w2c_path": (
-                        f"keyframes/kf_{keyframe.image_id:06d}_pose_w2c.npy"
-                        if keyframe.pose_w2c is not None
-                        else None
+                        f"keyframes/kf_{keyframe.image_id:06d}_pose_w2c.npy" if keyframe.pose_w2c is not None else None
                     ),
                 }
             )
