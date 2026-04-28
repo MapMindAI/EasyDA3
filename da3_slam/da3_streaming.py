@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import queue
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from collections import deque
@@ -61,6 +63,22 @@ class DA3ChunkRecord:
 
 
 @dataclass
+class DA3BackendJob:
+    chunk_id: int
+    image_ids: List[int]
+    images_bgr: List[np.ndarray]
+
+
+@dataclass
+class DA3BackendResult:
+    chunk_id: int
+    image_ids: List[int]
+    optimized_image_ids: List[int] = field(default_factory=list)
+    error: Optional[str] = None
+    traceback_text: Optional[str] = None
+
+
+@dataclass
 class MappingProcessResult:
     frame_id: int
     is_keyframe: bool
@@ -68,9 +86,15 @@ class MappingProcessResult:
 
     da3_ran: bool = False
     new_chunk_id: Optional[int] = None
+    completed_chunk_ids: List[int] = field(default_factory=list)
+
+    da3_scheduled: bool = False
+    scheduled_chunk_id: Optional[int] = None
 
     optimization_ran: bool = False
     optimized_image_ids: List[int] = field(default_factory=list)
+
+    backend_error: Optional[str] = None
 
     flow_result: Any = None
 
@@ -146,7 +170,7 @@ class DA3StreamingMappingPipeline:
         self.da3_stride_new_keyframes = int(da3_stride_new_keyframes)
         self.optimizer_num_chunks = int(optimizer_num_chunks)
         self.anchor_prior_weight = float(anchor_prior_weight)
-        self.scale_be_one_prior_weight = float(1e2)
+        self.scale_be_one_prior_weight = float(1e1)
         self.save_depth_png_preview = save_depth_png_preview
         self.min_valid_chunk_scale = 1e-4
         self.max_valid_chunk_scale = 1e4
@@ -173,6 +197,16 @@ class DA3StreamingMappingPipeline:
         self.optimized_chunk_scales: Dict[int, float] = {}
         self.updated_keyframes: Set[int] = set()
 
+        self.backend_job_queue: "queue.Queue[DA3BackendJob]" = queue.Queue(maxsize=1)
+        self.backend_result_queue: "queue.Queue[DA3BackendResult]" = queue.Queue()
+        self.backend_stop_event = threading.Event()
+        self.backend_thread = threading.Thread(
+            target=self._backend_worker_loop,
+            name="DA3BackendWorker",
+            daemon=True,
+        )
+        self.backend_thread.start()
+
     def _sanitize_chunk_scale(self, scale: float, default: float = 1.0) -> float:
         scale = float(scale)
 
@@ -194,166 +228,254 @@ class DA3StreamingMappingPipeline:
         Steps:
             1. Run optical-flow frontend.
             2. If keyframe, add to sliding window.
-            3. If window is full and enough new keyframes exist, run DA3.
-            4. After DA3, optimize latest K chunks.
-            5. Save keyframe RGB/depth/intrinsics/pose to disk.
+            3. If window is full and enough new keyframes exist, enqueue DA3.
+            4. DA3, optimization, and backend saves run on the worker thread.
+            5. Return any completed backend results from previous async jobs.
 
         Returns:
             MappingProcessResult
         """
 
-        self.frame_id += 1
+        with self.state_lock:
+            self.frame_id += 1
+            frame_id = self.frame_id
 
         flow_result = self.flow_processor.process(image)
 
         output = MappingProcessResult(
-            frame_id=self.frame_id,
+            frame_id=frame_id,
             is_keyframe=bool(flow_result.is_keyframe),
             keyframe_id=None,
             flow_result=flow_result,
         )
 
+        self._collect_backend_results(output)
+
         if not flow_result.is_keyframe:
             return output
 
-        keyframe_id = self._add_keyframe(image)
+        keyframe_id = self._add_keyframe(image, source_frame_id=frame_id)
         output.keyframe_id = keyframe_id
 
         if self._should_run_da3():
-            chunk = self._run_da3_on_current_window()
-            output.da3_ran = True
-            output.new_chunk_id = chunk.chunk_id
-
-            opt_image_ids = self._optimize_latest_chunks()
-            output.optimization_ran = len(opt_image_ids) > 0
-            output.optimized_image_ids = opt_image_ids
-
-            self._save_all_complete_keyframes()
-            self._save_manifest()
+            scheduled_chunk_id = self._schedule_da3_on_current_window()
+            if scheduled_chunk_id is not None:
+                output.da3_scheduled = True
+                output.scheduled_chunk_id = scheduled_chunk_id
 
         return output
+
+    def close(self, wait: bool = False, drain: bool = False):
+        if drain:
+            self.backend_job_queue.join()
+
+        self.backend_stop_event.set()
+
+        if wait and self.backend_thread.is_alive():
+            self.backend_thread.join()
 
     # ---------------------------------------------------------------------
     # Keyframe handling
     # ---------------------------------------------------------------------
 
-    def _add_keyframe(self, image: np.ndarray) -> int:
+    def _add_keyframe(self, image: np.ndarray, source_frame_id: int) -> int:
         image_bgr = self._to_bgr_uint8(image)
 
-        image_id = self.next_keyframe_id
-        self.next_keyframe_id += 1
+        with self.state_lock:
+            image_id = self.next_keyframe_id
+            self.next_keyframe_id += 1
 
-        record = KeyframeRecord(
-            image_id=image_id,
-            source_frame_id=self.frame_id,
-            image_bgr=image_bgr.copy(),
-        )
+            record = KeyframeRecord(
+                image_id=image_id,
+                source_frame_id=source_frame_id,
+                image_bgr=image_bgr.copy(),
+            )
 
-        self.keyframes[image_id] = record
-        self.sliding_keyframe_ids.append(image_id)
-        self.new_keyframes_since_last_da3 += 1
+            self.keyframes[image_id] = record
+            self.sliding_keyframe_ids.append(image_id)
+            self.new_keyframes_since_last_da3 += 1
 
         self._save_keyframe_rgb(record)
 
         return image_id
 
     def _should_run_da3(self) -> bool:
-        if len(self.sliding_keyframe_ids) < self.window_size:
-            return False
+        with self.state_lock:
+            if len(self.sliding_keyframe_ids) < self.window_size:
+                return False
 
-        if self.new_keyframes_since_last_da3 < self.da3_stride_new_keyframes:
-            return False
+            if self.new_keyframes_since_last_da3 < self.da3_stride_new_keyframes:
+                return False
 
-        return True
+            return True
 
     # ---------------------------------------------------------------------
     # DA3 chunk processing
     # ---------------------------------------------------------------------
 
-    def _run_da3_on_current_window(self) -> DA3ChunkRecord:
-        image_ids = list(self.sliding_keyframe_ids)
-        images = [self.keyframes[i].image_bgr for i in image_ids]
+    def _schedule_da3_on_current_window(self) -> Optional[int]:
+        if self.backend_job_queue.full():
+            return None
 
-        da3_result = self.da3_client.run(images)
+        with self.state_lock:
+            if len(self.sliding_keyframe_ids) < self.window_size:
+                return None
+
+            if self.new_keyframes_since_last_da3 < self.da3_stride_new_keyframes:
+                return None
+
+            chunk_id = self.next_chunk_id
+            image_ids = list(self.sliding_keyframe_ids)
+            images = [self.keyframes[i].image_bgr.copy() for i in image_ids]
+            previous_new_keyframes = self.new_keyframes_since_last_da3
+
+            self.next_chunk_id += 1
+            self.new_keyframes_since_last_da3 = 0
+
+        job = DA3BackendJob(
+            chunk_id=chunk_id,
+            image_ids=image_ids,
+            images_bgr=images,
+        )
+
+        try:
+            self.backend_job_queue.put_nowait(job)
+        except queue.Full:
+            with self.state_lock:
+                self.next_chunk_id -= 1
+                self.new_keyframes_since_last_da3 = previous_new_keyframes
+            return None
+
+        return chunk_id
+
+    def _run_da3_on_current_window(self) -> DA3ChunkRecord:
+        with self.state_lock:
+            chunk_id = self.next_chunk_id
+            image_ids = list(self.sliding_keyframe_ids)
+            images = [self.keyframes[i].image_bgr.copy() for i in image_ids]
+            self.next_chunk_id += 1
+            self.new_keyframes_since_last_da3 = 0
+
+        job = DA3BackendJob(
+            chunk_id=chunk_id,
+            image_ids=image_ids,
+            images_bgr=images,
+        )
+
+        return self._run_da3_job(job)
+
+    def _run_da3_job(self, job: DA3BackendJob) -> DA3ChunkRecord:
+        da3_result = self.da3_client.run(job.images_bgr)
 
         depth_list = [np.asarray(d, dtype=np.float32) for d in da3_result["depth_list"]]
         intrinsics_list = [np.asarray(k, dtype=np.float32) for k in da3_result["intrinsics_list"]]
         extrinsics_list = [self._as_4x4(np.asarray(e, dtype=np.float32)) for e in da3_result["extrinsics_list"]]
 
-        if not (len(depth_list) == len(intrinsics_list) == len(extrinsics_list) == len(image_ids)):
+        if not (len(depth_list) == len(intrinsics_list) == len(extrinsics_list) == len(job.image_ids)):
             raise RuntimeError("DA3 output count does not match input keyframe count.")
 
-        chunk_id = self.next_chunk_id
-        self.next_chunk_id += 1
-
         chunk = DA3ChunkRecord(
-            chunk_id=chunk_id,
-            image_ids=image_ids,
+            chunk_id=job.chunk_id,
+            image_ids=job.image_ids,
             depth_list=depth_list,
             intrinsics_list=intrinsics_list,
             extrinsics_list=extrinsics_list,
             scale=1.0,
         )
 
-        self.chunks.append(chunk)
+        with self.state_lock:
+            self.chunks.append(chunk)
 
-        for local_idx, image_id in enumerate(image_ids):
-            kf = self.keyframes[image_id]
-            kf.depth = depth_list[local_idx]
-            kf.intrinsics = intrinsics_list[local_idx]
-            kf.da3_local_w2c = extrinsics_list[local_idx]
-            kf.last_chunk_id = chunk_id
+            for local_idx, image_id in enumerate(job.image_ids):
+                kf = self.keyframes.get(image_id)
+                if kf is None:
+                    continue
 
-        self.new_keyframes_since_last_da3 = 0
+                kf.depth = depth_list[local_idx]
+                kf.intrinsics = intrinsics_list[local_idx]
+                kf.da3_local_w2c = extrinsics_list[local_idx]
+                kf.last_chunk_id = job.chunk_id
+                self.updated_keyframes.add(image_id)
 
         self._save_chunk(chunk)
 
         return chunk
 
+    def _backend_worker_loop(self):
+        while not self.backend_stop_event.is_set():
+            try:
+                job = self.backend_job_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            try:
+                chunk = self._run_da3_job(job)
+                opt_image_ids = self._optimize_latest_chunks()
+                self._save_current_keyframes()
+                self._save_manifest()
+
+                self.backend_result_queue.put(
+                    DA3BackendResult(
+                        chunk_id=chunk.chunk_id,
+                        image_ids=chunk.image_ids,
+                        optimized_image_ids=opt_image_ids,
+                    )
+                )
+            except Exception as exc:
+                self.backend_result_queue.put(
+                    DA3BackendResult(
+                        chunk_id=job.chunk_id,
+                        image_ids=job.image_ids,
+                        error=str(exc),
+                        traceback_text=traceback.format_exc(),
+                    )
+                )
+            finally:
+                self.backend_job_queue.task_done()
+
+    def _collect_backend_results(self, output: MappingProcessResult):
+        while True:
+            try:
+                result = self.backend_result_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if result.error is not None:
+                output.backend_error = result.error
+            else:
+                output.da3_ran = True
+                output.new_chunk_id = result.chunk_id
+                output.completed_chunk_ids.append(result.chunk_id)
+                output.optimized_image_ids.extend(result.optimized_image_ids)
+
+            self.backend_result_queue.task_done()
+
+        if output.optimized_image_ids:
+            output.optimization_ran = True
+            output.optimized_image_ids = sorted(set(output.optimized_image_ids))
+
     # ---------------------------------------------------------------------
     # Optimization
     # ---------------------------------------------------------------------
-
     def _optimize_latest_chunks(self) -> List[int]:
-        if len(self.chunks) == 0:
-            return []
+        with self.state_lock:
+            if len(self.chunks) == 0:
+                return []
 
-        chunks_to_optimize = self.chunks[-self.optimizer_num_chunks :]
+            chunks_to_optimize = list(self.chunks[-self.optimizer_num_chunks :])
+            optimized_pose_c2w = {
+                int(k): np.asarray(v, dtype=np.float64).copy() for k, v in self.optimized_pose_c2w.items()
+            }
+            optimized_chunk_scales = dict(self.optimized_chunk_scales)
+
         anchor_chunk = chunks_to_optimize[0]
 
         # add poses
-        pose_chunks = [self._chunk_record_to_pose_chunk(c) for c in chunks_to_optimize]
+        pose_chunks = [self._chunk_record_to_pose_chunk(c, optimized_chunk_scales) for c in chunks_to_optimize]
 
         # add priors
-        # pose_priors = self._make_anchor_pose_priors(anchor_chunk)
         scale_priors = []
         pose_priors = []
-
-        is_first_optimization = len(self.optimized_pose_c2w) == 0
-        fix_first_pose_identity = True
-        if is_first_optimization:
-            # First ever local map:
-            #   first image pose = identity
-            #   first chunk scale = 1
-            # fix_first_pose_identity = True
-            fix_first_chunk_scale_one = True
-        else:
-            # Later local maps:
-            #   first chunk is fixed using strong pose priors.
-            #
-            # The scale of the anchor chunk is effectively fixed because all
-            # poses inside that chunk are strongly constrained by priors.
-            # fix_first_pose_identity = False
-            fix_first_chunk_scale_one = False
-            anchor_scale = self._sanitize_chunk_scale(anchor_chunk.scale, default=1.0)
-
-            scale_priors.append(
-                {
-                    "chunk_id": anchor_chunk.chunk_id,
-                    "scale": anchor_scale,
-                    "weight": 1e2,
-                }
-            )
 
         # the scale of other chunks couldn't be too different from 1
         for chunk in chunks_to_optimize:
@@ -366,15 +488,15 @@ class DA3StreamingMappingPipeline:
             )
 
         local2world = anchor_chunk.extrinsics_list[0]
-        if anchor_chunk.image_ids[0] in self.optimized_pose_c2w:
-            local2world = self.optimized_pose_c2w[anchor_chunk.image_ids[0]]
+        if anchor_chunk.image_ids[0] in optimized_pose_c2w:
+            local2world = optimized_pose_c2w[anchor_chunk.image_ids[0]]
 
         result = self.optimizer.optimize(
             chunks=pose_chunks,
             pose_priors=pose_priors,
             scale_priors=scale_priors,
-            fix_first_pose_identity=fix_first_pose_identity,
-            fix_first_chunk_scale_one=fix_first_chunk_scale_one,
+            fix_first_pose_identity=True,
+            fix_first_chunk_scale_one=False,
         )
 
         optimized_image_ids = sorted(result.pose_matrices.keys())
@@ -383,7 +505,6 @@ class DA3StreamingMappingPipeline:
             for image_id, pose_c2l in result.pose_matrices.items():
                 image_id = int(image_id)
                 # convert the pose to world coordinate
-                # print(image_id, pose_c2w)
                 self.updated_keyframes.add(image_id)
 
                 pose_c2l = np.asarray(pose_c2l, dtype=np.float64)
@@ -397,19 +518,25 @@ class DA3StreamingMappingPipeline:
                     kf.pose_c2w = pose_c2w
                     kf.pose_w2c = pose_w2c
 
-        for chunk in chunks_to_optimize:
-            if chunk.chunk_id in result.chunk_scales:
-                chunk.scale = float(result.chunk_scales[chunk.chunk_id])
-                chunk.initial_error = result.initial_error
-                chunk.final_error = result.final_error
-                self.optimized_chunk_scales[chunk.chunk_id] = chunk.scale
+        with self.state_lock:
+            for chunk in chunks_to_optimize:
+                if chunk.chunk_id in result.chunk_scales:
+                    chunk.scale = float(result.chunk_scales[chunk.chunk_id])
+                    chunk.initial_error = result.initial_error
+                    chunk.final_error = result.final_error
+                    self.optimized_chunk_scales[chunk.chunk_id] = chunk.scale
 
         return optimized_image_ids
 
-    def _chunk_record_to_pose_chunk(self, chunk: DA3ChunkRecord):
+    def _chunk_record_to_pose_chunk(
+        self,
+        chunk: DA3ChunkRecord,
+        optimized_chunk_scales: Optional[Dict[int, float]] = None,
+    ):
         scale = float(chunk.scale)
-        if chunk.chunk_id in self.optimized_chunk_scales:
-            scale = self.optimized_chunk_scales[chunk.chunk_id]
+        optimized_chunk_scales = optimized_chunk_scales or self.optimized_chunk_scales
+        if chunk.chunk_id in optimized_chunk_scales:
+            scale = optimized_chunk_scales[chunk.chunk_id]
         if not np.isfinite(scale) or scale <= 1e-4:
             print(f"[WARN] Chunk {chunk.chunk_id} has invalid scale {scale}, " "resetting to 1.0")
             scale = 1.0
@@ -418,7 +545,7 @@ class DA3StreamingMappingPipeline:
             chunk_id=chunk.chunk_id,
             image_ids=chunk.image_ids,
             poses=chunk.extrinsics_list,
-            scale=chunk.scale,
+            scale=scale,
             weight=1.0,
         )
 
@@ -459,13 +586,21 @@ class DA3StreamingMappingPipeline:
         cv2.imwrite(str(path), kf.image_bgr)
 
     def _save_all_complete_keyframes(self):
-        for kf in self.keyframes.values():
+        with self.state_lock:
+            keyframes = list(self.keyframes.values())
+
+        for kf in keyframes:
             self._save_keyframe(kf)
 
     def _save_current_keyframes(self):
-        for kf in self.updated_keyframes:
+        with self.state_lock:
+            keyframes = [
+                self.keyframes[image_id] for image_id in sorted(self.updated_keyframes) if image_id in self.keyframes
+            ]
+            self.updated_keyframes.clear()
+
+        for kf in keyframes:
             self._save_keyframe(kf)
-        self.updated_keyframes.clear()
 
     def _save_keyframe(self, kf: KeyframeRecord):
         self._save_keyframe_rgb(kf)
@@ -520,51 +655,53 @@ class DA3StreamingMappingPipeline:
             json.dump(meta, f, indent=2)
 
     def _save_manifest(self):
-        manifest = {
-            "window_size": self.window_size,
-            "da3_stride_new_keyframes": self.da3_stride_new_keyframes,
-            "optimizer_num_chunks": self.optimizer_num_chunks,
-            "num_keyframes": len(self.keyframes),
-            "num_chunks": len(self.chunks),
-            "keyframes": [],
-            "chunks": [],
-        }
+        with self.state_lock:
+            keyframes = [self.keyframes[image_id] for image_id in sorted(self.keyframes.keys())]
+            chunks = list(self.chunks)
 
-        for image_id in sorted(self.keyframes.keys()):
-            kf = self.keyframes[image_id]
+            manifest = {
+                "window_size": self.window_size,
+                "da3_stride_new_keyframes": self.da3_stride_new_keyframes,
+                "optimizer_num_chunks": self.optimizer_num_chunks,
+                "num_keyframes": len(keyframes),
+                "num_chunks": len(chunks),
+                "keyframes": [],
+                "chunks": [],
+            }
 
-            manifest["keyframes"].append(
-                {
-                    "image_id": kf.image_id,
-                    "source_frame_id": kf.source_frame_id,
-                    "last_chunk_id": kf.last_chunk_id,
-                    "has_depth": kf.depth is not None,
-                    "has_intrinsics": kf.intrinsics is not None,
-                    "has_pose": kf.pose_c2w is not None,
-                    "rgb_path": f"keyframes/kf_{kf.image_id:06d}_rgb.png",
-                    "depth_path": f"keyframes/kf_{kf.image_id:06d}_depth.npy" if kf.depth is not None else None,
-                    "intrinsics_path": f"keyframes/kf_{kf.image_id:06d}_intrinsics.npy"
-                    if kf.intrinsics is not None
-                    else None,
-                    "pose_c2w_path": f"keyframes/kf_{kf.image_id:06d}_pose_c2w.npy"
-                    if kf.pose_c2w is not None
-                    else None,
-                    "pose_w2c_path": f"keyframes/kf_{kf.image_id:06d}_pose_w2c.npy"
-                    if kf.pose_w2c is not None
-                    else None,
-                }
-            )
+            for kf in keyframes:
+                manifest["keyframes"].append(
+                    {
+                        "image_id": kf.image_id,
+                        "source_frame_id": kf.source_frame_id,
+                        "last_chunk_id": kf.last_chunk_id,
+                        "has_depth": kf.depth is not None,
+                        "has_intrinsics": kf.intrinsics is not None,
+                        "has_pose": kf.pose_c2w is not None,
+                        "rgb_path": f"keyframes/kf_{kf.image_id:06d}_rgb.png",
+                        "depth_path": f"keyframes/kf_{kf.image_id:06d}_depth.npy" if kf.depth is not None else None,
+                        "intrinsics_path": f"keyframes/kf_{kf.image_id:06d}_intrinsics.npy"
+                        if kf.intrinsics is not None
+                        else None,
+                        "pose_c2w_path": f"keyframes/kf_{kf.image_id:06d}_pose_c2w.npy"
+                        if kf.pose_c2w is not None
+                        else None,
+                        "pose_w2c_path": f"keyframes/kf_{kf.image_id:06d}_pose_w2c.npy"
+                        if kf.pose_w2c is not None
+                        else None,
+                    }
+                )
 
-        for chunk in self.chunks:
-            manifest["chunks"].append(
-                {
-                    "chunk_id": chunk.chunk_id,
-                    "image_ids": chunk.image_ids,
-                    "scale": chunk.scale,
-                    "initial_error": chunk.initial_error,
-                    "final_error": chunk.final_error,
-                }
-            )
+            for chunk in chunks:
+                manifest["chunks"].append(
+                    {
+                        "chunk_id": chunk.chunk_id,
+                        "image_ids": chunk.image_ids,
+                        "scale": chunk.scale,
+                        "initial_error": chunk.initial_error,
+                        "final_error": chunk.final_error,
+                    }
+                )
 
         with open(self.output_dir / "manifest.json", "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
@@ -683,28 +820,39 @@ if __name__ == "__main__":
     image_files = glob.glob("data/cam0-20260427T031458Z-3-001/cam0/data/*.png")
     image_files.sort()
 
-    for image_file in image_files:
-        image = cv2.imread(image_file)
+    quit_requested = False
 
-        result = pipeline.process_image(image)
-        # Update trajectory window
-        traj_vis.update_from_pipeline(pipeline)
+    try:
+        for image_file in image_files:
+            image = cv2.imread(image_file)
 
-        if result.is_keyframe:
-            print(f"New keyframe: {result.keyframe_id}")
+            result = pipeline.process_image(image)
+            # Update trajectory window
+            traj_vis.update_from_pipeline(pipeline)
 
-        if result.da3_ran:
-            print(f"DA3 chunk created: {result.new_chunk_id}")
+            if result.is_keyframe:
+                print(f"New keyframe: {result.keyframe_id}")
 
-        if result.optimization_ran:
-            print(f"Optimized images: {result.optimized_image_ids}")
+            if result.da3_scheduled:
+                print(f"DA3 chunk scheduled: {result.scheduled_chunk_id}")
 
-        vis = visualize_optical_flow_result(image, result.flow_result)
+            if result.da3_ran:
+                print(f"DA3 chunk completed: {result.new_chunk_id}")
 
-        cv2.imshow("optical flow tracks", vis)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
+            if result.optimization_ran:
+                print(f"Optimized images: {result.optimized_image_ids}")
 
-    cv2.destroyAllWindows()
-    traj_vis.stop()
+            if result.backend_error:
+                print(f"DA3 backend error: {result.backend_error}")
+
+            vis = visualize_optical_flow_result(image, result.flow_result)
+
+            cv2.imshow("optical flow tracks", vis)
+            key = cv2.waitKey(30) & 0xFF
+            if key == ord("q"):
+                quit_requested = True
+                break
+    finally:
+        pipeline.close(wait=not quit_requested, drain=not quit_requested)
+        cv2.destroyAllWindows()
+        traj_vis.stop()
