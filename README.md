@@ -1,25 +1,31 @@
 # EasyLocalization
 
-easy localization lib
+# Build environment
 
+```
+pip install -r requirement.txt
+```
 
+# Run DA3 triton server
 
+Download https://github.com/MapMindAI/EasyTensorRT, and run the server with :
 
+```
+./run_server_trt.sh
+```
+
+Docker image will be downloaded, onnx model will be transformed to triton plan file.
 
 # DA3 VO
 
-
 visual odometry using depthanything 3
-
 * optical flow to get keyframes.
 * run DA3 for all key frames if new keyframes (half DA3 input images size) added.
-
 
 **Use optical-flow VO as the real-time frontend, and use DA3 as a delayed local-geometry backend.**
 DA3 should generate high-quality depth/pose constraints per chunk; pose graph optimization will integrate those constraints globally.
 
 DA3 is suitable for this because it predicts spatially consistent geometry from arbitrary visual inputs, with or without known camera poses, and the official DA3-Streaming code is explicitly designed for long videos through chunk streaming under limited GPU memory.
-
 
 ```mermaid
 flowchart LR
@@ -36,16 +42,11 @@ flowchart LR
     I --> L[Update global keyframe poses<br>Fuse / update map]
 ```
 
+![da3 slame](assets/da3_slam.gif)
 
-pip dependences:
-opencv
-gtsam
-pytest
-tritonclient
-logging
+
+# DA3 MVS
 
 
 
-TODO:
-* filter too close current tracks in optical flow track.
-* each chunk as a TSDF, and show together in open3d viz.
+# DA3 stereo depth
