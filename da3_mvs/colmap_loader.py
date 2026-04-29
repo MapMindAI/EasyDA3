@@ -788,12 +788,69 @@ def build_covisibility_graph(images, points3D, min_shared_points=20):
     return graph
 
 
-def chunk_images_from_graph(images, graph, chunk_size):
+def _camera_center_from_image(image):
+    R = qvec2rotmat(np.asarray(image.qvec, dtype=np.float64))
+    t = np.asarray(image.tvec, dtype=np.float64)
+    return -R.T @ t
+
+
+def _rotation_angle_deg_between_images(image_a, image_b):
+    Ra = qvec2rotmat(np.asarray(image_a.qvec, dtype=np.float64))
+    Rb = qvec2rotmat(np.asarray(image_b.qvec, dtype=np.float64))
+    Rrel = Ra @ Rb.T
+    tr = np.trace(Rrel)
+    cos_theta = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_theta)))
+
+
+def estimate_dynamic_min_distance(images, graph, percentile=35.0, scale=0.35):
+    """
+    Estimate a scene-dependent distance threshold from overall camera spacing.
+    Uses graph edges when available; falls back to all image pairs.
+    """
+    centers = {image_id: _camera_center_from_image(img) for image_id, img in images.items()}
+    dists = []
+
+    for a, nbrs in graph.items():
+        for b in nbrs.keys():
+            if b <= a:
+                continue
+            d = float(np.linalg.norm(centers[a] - centers[b]))
+            if np.isfinite(d) and d > 1e-9:
+                dists.append(d)
+
+    if len(dists) == 0:
+        ids = sorted(images.keys())
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                d = float(np.linalg.norm(centers[ids[i]] - centers[ids[j]]))
+                if np.isfinite(d) and d > 1e-9:
+                    dists.append(d)
+
+    if len(dists) == 0:
+        return 0.0
+
+    base = float(np.percentile(np.asarray(dists, dtype=np.float64), percentile))
+    return max(0.0, base * float(scale))
+
+
+def chunk_images_from_graph(images, graph, chunk_size, min_distance=0.02, min_rot=2.0):
     """
     Split images into chunks of size N using graph connectivity preference.
+
+    Args:
+        min_distance: minimum translation movement (scene unit). Final threshold
+            is max(min_distance, dynamic_threshold_from_scene).
+        min_rot: minimum relative rotation angle in degrees.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be > 0")
+
+    dynamic_min_distance = estimate_dynamic_min_distance(images, graph)
+    effective_min_distance = max(float(min_distance), float(dynamic_min_distance))
+    min_rot = float(min_rot)
+
+    centers = {image_id: _camera_center_from_image(img) for image_id, img in images.items()}
 
     unassigned = set(images.keys())
     chunks = []
@@ -810,6 +867,12 @@ def chunk_images_from_graph(images, graph, chunk_size):
             best = None
             best_score = -1
             for cand in unassigned:
+                # Enforce movement relative to seed view so each chunk has enough baseline.
+                dist_from_seed = float(np.linalg.norm(centers[cand] - centers[seed]))
+                rot_from_seed = _rotation_angle_deg_between_images(images[cand], images[seed])
+                if dist_from_seed < effective_min_distance or rot_from_seed < min_rot:
+                    continue
+
                 score = 0
                 neighbors = graph.get(cand, {})
                 for existing in chunk:

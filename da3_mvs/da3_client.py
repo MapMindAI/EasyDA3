@@ -84,6 +84,8 @@ class DepthAnything3:
         self.desired_outputs = [
             grpcclient.InferRequestedOutput("depth"),
             grpcclient.InferRequestedOutput("depth_conf"),
+            grpcclient.InferRequestedOutput("intrinsics"),
+            grpcclient.InferRequestedOutput("extrinsics"),
         ]
 
     def _preprocess_single_image(self, image_numpy):
@@ -172,6 +174,63 @@ class DepthAnything3:
             raise RuntimeError(f"Triton returned no '{key}' output")
         return result
 
+    def _to_w2c_44(self, ext):
+        E = np.asarray(ext, dtype=np.float64)
+        if E.shape == (3, 4):
+            E44 = np.eye(4, dtype=np.float64)
+            E44[:3, :4] = E
+            return E44
+        if E.shape == (4, 4):
+            return E
+        raise ValueError(f"Extrinsic shape must be (3,4) or (4,4), got {E.shape}")
+
+    def _camera_center_from_w2c(self, ext):
+        E = self._to_w2c_44(ext)
+        R = E[:3, :3]
+        t = E[:3, 3]
+        return -R.T @ t
+
+    def _estimate_scale_from_pose_sets(self, input_extrinsics, output_extrinsics):
+        """
+        Estimate scalar s so that input camera centers ~= s * output camera centers.
+        Returns 1.0 if scale cannot be estimated robustly.
+        """
+        if input_extrinsics is None or output_extrinsics is None:
+            return 1.0
+        if len(input_extrinsics) != len(output_extrinsics):
+            return 1.0
+
+        in_centers = []
+        out_centers = []
+        for Ein, Eout in zip(input_extrinsics, output_extrinsics):
+            cin = self._camera_center_from_w2c(Ein)
+            cout = self._camera_center_from_w2c(Eout)
+            if np.all(np.isfinite(cin)) and np.all(np.isfinite(cout)):
+                in_centers.append(cin)
+                out_centers.append(cout)
+
+        if len(in_centers) < 2:
+            return 1.0
+
+        in_centers = np.asarray(in_centers, dtype=np.float64)
+        out_centers = np.asarray(out_centers, dtype=np.float64)
+
+        ratios = []
+        n = in_centers.shape[0]
+        for i in range(n):
+            for j in range(i + 1, n):
+                din = np.linalg.norm(in_centers[i] - in_centers[j])
+                dout = np.linalg.norm(out_centers[i] - out_centers[j])
+                if din > 1e-9 and dout > 1e-9:
+                    ratios.append(din / dout)
+        if len(ratios) == 0:
+            return 1.0
+
+        s = float(np.median(np.asarray(ratios, dtype=np.float64)))
+        if not np.isfinite(s) or s <= 0.0:
+            return 1.0
+        return s
+
     def _build_pose_tensors(self, intrinsics_list, extrinsics_list, num_images):
         if intrinsics_list is None or extrinsics_list is None:
             return None, None
@@ -256,6 +315,8 @@ class DepthAnything3:
 
         depth = self.get_response(response, "depth")
         depth_conf = self.get_response(response, "depth_conf")
+        extrinsics_out = self.get_response(response, "extrinsics")
+        intrinsics_out = self.get_response(response, "intrinsics")
 
         # expected [1, N, H, W]
         if depth.ndim != 4 or depth.shape[0] != 1:
@@ -267,26 +328,49 @@ class DepthAnything3:
         if depth_conf.shape != depth.shape:
             raise ValueError(f"Unexpected depth_conf output shape: {depth_conf.shape}, expected {depth.shape}")
 
+        extrinsics_out_list_raw = [extrinsics_out[0, i] for i in range(num_images)]
+        scale_to_input = self._estimate_scale_from_pose_sets(
+            input_extrinsics=extrinsics_list,
+            output_extrinsics=extrinsics_out_list_raw,
+        )
+
         depth_list = []
         depth_conf_list = []
-
+        intrinsics_out_list = []
+        extrinsics_out_list = []
         for i in range(num_images):
             depth_i = depth[0, i]
             depth_conf_i = depth_conf[0, i]
             orig_h, orig_w = meta["orig_sizes"][i]
-            depth_i_resized = cv2.resize(depth_i, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+            depth_i_resized = (
+                cv2.resize(depth_i, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST) * scale_to_input
+            )
             depth_conf_i_resized = cv2.resize(depth_conf_i, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
             depth_list.append(depth_i_resized)
             depth_conf_list.append(depth_conf_i_resized.astype(np.float32))
 
+            factor_x = orig_w / depth_i.shape[1]
+            factor_y = orig_h / depth_i.shape[0]
+            intri = intrinsics_out[0, i].copy()
+            intri[0, 0] *= factor_x
+            intri[0, 2] *= factor_x
+            # TODO: the image might be distorted, we use x focus currently
+            # we better keep the image ratio while input
+            intri[1, 1] *= factor_x
+            # intri[1, 1] *= factor_y
+            intri[1, 2] *= factor_y
+            intrinsics_out_list.append(intri)
+            Eout = self._to_w2c_44(extrinsics_out_list_raw[i])
+            Eout[:3, 3] *= scale_to_input
+            extrinsics_out_list.append(Eout.astype(np.float32))
+
         result = {
             "depth_list": depth_list,  # list of HxW
             "depth_conf_list": depth_conf_list,  # list of HxW
+            "intrinsics_out_list": intrinsics_out_list,
+            "extrinsics_out_list": extrinsics_out_list,
+            "pose_scale_to_input": float(scale_to_input),
         }
-        if intrinsics_list is not None:
-            result["intrinsics_list"] = intrinsics_list
-        if extrinsics_list is not None:
-            result["extrinsics_list"] = extrinsics_list
         return result
 
     def run_paths(self, image_paths):
@@ -333,9 +417,9 @@ class DepthAnything3:
 """
 python da3_mvs/da3_client.py \
 --triton-url 0.0.0.0:8001 \
---colmap-model-dir ../EasyGaussianSplatting/data/insta360_test/sparse/0 \
---image-dir ../EasyGaussianSplatting/data/insta360_test/images \
---output-dir ../EasyGaussianSplatting/data/insta360_test/da3 \
+--colmap-model-dir ../EasyGaussianSplatting/data/gopro_test/sparse/0 \
+--image-dir ../EasyGaussianSplatting/data/gopro_test/images \
+--output-dir ../EasyGaussianSplatting/data/gopro_test/da3 \
 --chunk-size 10 \
 --min-shared-points 20
 """
@@ -351,6 +435,18 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, required=True, help="Output directory")
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--min-shared-points", type=int, default=20)
+    parser.add_argument(
+        "--min-distance",
+        type=float,
+        default=0.04,
+        help="Minimum translation movement for chunking; final threshold is max(this, dynamic threshold).",
+    )
+    parser.add_argument(
+        "--min-rot",
+        type=float,
+        default=4.0,
+        help="Minimum rotation movement in degrees for chunking.",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -368,7 +464,13 @@ if __name__ == "__main__":
 
     images, cameras, points3D = load_sparse_model(args.colmap_model_dir)
     graph = build_covisibility_graph(images, points3D, min_shared_points=args.min_shared_points)
-    chunks = chunk_images_from_graph(images, graph, chunk_size=args.chunk_size)
+    chunks = chunk_images_from_graph(
+        images,
+        graph,
+        chunk_size=args.chunk_size,
+        min_distance=args.min_distance,
+        min_rot=args.min_rot,
+    )
     logger.info("Loaded model: %d images, %d chunks", len(images), len(chunks))
 
     total_start_ms = time.time() * 1000.0
@@ -376,6 +478,10 @@ if __name__ == "__main__":
     for chunk_idx, chunk in enumerate(chunks):
         payload = get_chunk_payload(images, cameras, chunk)
         image_paths = [os.path.join(args.image_dir, n) for n in payload["image_names"]]
+        if len(image_paths) < args.chunk_size:
+            logger.warning("Not enough images in the chunk")
+            continue
+
         img_list = []
         for p in image_paths:
             img = cv2.imread(p)
@@ -397,6 +503,8 @@ if __name__ == "__main__":
             chunk_end_ms - chunk_start_ms,
             len(chunk),
         )
+
+        logger.info("Chunk %d pose scale to input: %.6f", chunk_idx + 1, result["pose_scale_to_input"])
 
         for image_name, depth_i, conf_i in zip(
             payload["image_names"],
