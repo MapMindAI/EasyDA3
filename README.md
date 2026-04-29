@@ -73,7 +73,7 @@ python da3_mvs/fuse_rgbd_tsdf.py \
 --conf-threshold 2.0
 ```
 
-![da3 mvs tsdf](assets/da3_mvs_tsdf_mesh.png)
+![da3 mvs tsdf](assets/da3_mvs_tsdf_mesh.jpg)
 
 
 # DA3 stereo depth
