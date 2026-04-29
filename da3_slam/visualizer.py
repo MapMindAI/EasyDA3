@@ -43,6 +43,7 @@ class Open3DTrajectoryVisualizer:
         tsdf_min_confidence: float = 2.0,
         tsdf_use_pose_w2c_if_available: bool = True,
         max_live_chunks: int = 20,
+        follow_smoothing_alpha: float = 0.18,
     ):
         """
         Realtime Open3D trajectory visualizer.
@@ -74,6 +75,7 @@ class Open3DTrajectoryVisualizer:
         self.tsdf_use_pose_w2c_if_available = bool(tsdf_use_pose_w2c_if_available)
         self.map_dir = None if map_dir is None else Path(map_dir)
         self.max_live_chunks = int(max(1, max_live_chunks))
+        self.follow_smoothing_alpha = float(np.clip(follow_smoothing_alpha, 0.01, 1.0))
 
         self._lock = threading.Lock()
         self._poses_c2w: Dict[int, np.ndarray] = {}
@@ -98,6 +100,9 @@ class Open3DTrajectoryVisualizer:
         self._follow_latest_pose = True
         self._show_chunk_mesh = True
         self._show_chunk_pointcloud = False
+        self._follow_reference_pose_c2w: Optional[np.ndarray] = None
+        self._follow_reference_lookat: Optional[np.ndarray] = None
+        self._follow_smoothed_lookat: Optional[np.ndarray] = None
 
     def start(self):
         if self._running:
@@ -202,6 +207,8 @@ class Open3DTrajectoryVisualizer:
 
     def _on_toggle_follow_pose(self, vis):
         self._follow_latest_pose = not self._follow_latest_pose
+        if self._follow_latest_pose:
+            self._reset_follow_anchor()
         logger.info("Follow latest pose: %s", self._follow_latest_pose)
         return False
 
@@ -272,25 +279,48 @@ class Open3DTrajectoryVisualizer:
         if vc is None:
             return
 
-        lookat = np.asarray(pose_c2w[:3, 3], dtype=np.float64)
-        # Open3D Visualizer front points from lookat toward eye (reverse viewing ray),
-        # so use negative camera-forward to avoid backward-facing view.
-        front = -np.asarray(pose_c2w[:3, 2], dtype=np.float64)
-        # Camera convention is +Y down, therefore visual "up" is -Y in world.
-        up_cam = -np.asarray(pose_c2w[:3, 1], dtype=np.float64)
-        front_n = np.linalg.norm(front)
-        up_n = np.linalg.norm(up_cam)
-        if front_n > 1e-9:
-            front = front / front_n
-        if up_n > 1e-9:
-            up_cam = up_cam / up_n
+        pose_c2w = np.asarray(pose_c2w, dtype=np.float64)
+        if self._follow_reference_pose_c2w is None:
+            self._init_follow_anchor(vc, pose_c2w)
+
+        current_t = np.asarray(pose_c2w[:3, 3], dtype=np.float64)
+        reference_t = np.asarray(self._follow_reference_pose_c2w[:3, 3], dtype=np.float64)
+        delta_t = current_t - reference_t
+
+        target_lookat = self._follow_reference_lookat + delta_t
+
+        alpha = self.follow_smoothing_alpha
+        if self._follow_smoothed_lookat is None:
+            self._follow_smoothed_lookat = target_lookat.copy()
+        else:
+            self._follow_smoothed_lookat = (1.0 - alpha) * self._follow_smoothed_lookat + alpha * target_lookat
 
         try:
-            vc.set_lookat(lookat)
-            vc.set_front(front)
-            vc.set_up(up_cam)
+            vc.set_lookat(self._follow_smoothed_lookat)
         except Exception:
             pass
+
+    def _reset_follow_anchor(self):
+        self._follow_reference_pose_c2w = None
+        self._follow_reference_lookat = None
+        self._follow_smoothed_lookat = None
+
+    def _init_follow_anchor(self, vc, pose_c2w: np.ndarray):
+        self._follow_reference_pose_c2w = np.asarray(pose_c2w, dtype=np.float64).copy()
+
+        lookat = None
+
+        if hasattr(vc, "get_lookat"):
+            try:
+                lookat = np.asarray(vc.get_lookat(), dtype=np.float64).reshape(3)
+            except Exception:
+                lookat = None
+
+        if lookat is None:
+            lookat = np.asarray(pose_c2w[:3, 3], dtype=np.float64)
+
+        self._follow_reference_lookat = lookat
+        self._follow_smoothed_lookat = lookat.copy()
 
     def _update_trajectory(self, points: np.ndarray):
         if len(points) == 0:
