@@ -1,0 +1,4 @@
+opencv-python
+gtsam
+pytest
+tritonclient[all]
