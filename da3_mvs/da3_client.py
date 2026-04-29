@@ -12,6 +12,7 @@ try:
         build_covisibility_graph,
         chunk_images_from_graph,
         get_chunk_payload,
+        extrinsics_to_first_camera_frame,
     )
 except ImportError:
     from logging_utils import configure_logging, get_logger
@@ -20,6 +21,7 @@ except ImportError:
         build_covisibility_graph,
         chunk_images_from_graph,
         get_chunk_payload,
+        extrinsics_to_first_camera_frame,
     )
 
 
@@ -197,15 +199,44 @@ class DepthAnything3:
         E_tensor = np.expand_dims(np.stack(extrinsics, axis=0), axis=0)  # [1, N, 4, 4]
         return K_tensor.astype(np.float32), E_tensor.astype(np.float32)
 
+    def _scale_intrinsics_for_resized_inputs(self, intrinsics_list, orig_sizes):
+        """
+        Scale intrinsics from original image resolution to resized network input resolution.
+        """
+        if intrinsics_list is None:
+            return None
+        if len(intrinsics_list) != len(orig_sizes):
+            raise ValueError("intrinsics_list must match number of input images")
+
+        scaled = []
+        for i, (K_in, (orig_h, orig_w)) in enumerate(zip(intrinsics_list, orig_sizes)):
+            if orig_h <= 0 or orig_w <= 0:
+                raise ValueError(f"Invalid original size at index {i}: {(orig_h, orig_w)}")
+            K = np.asarray(K_in, dtype=np.float32).copy()
+            if K.shape != (3, 3):
+                raise ValueError(f"intrinsics_list[{i}] shape must be (3,3), got {K.shape}")
+            sx = float(self.input_width) / float(orig_w)
+            sy = float(self.input_height) / float(orig_h)
+            K[0, 0] *= sx
+            K[0, 2] *= sx
+            K[1, 1] *= sy
+            K[1, 2] *= sy
+            scaled.append(K)
+        return scaled
+
     def run(self, images, intrinsics_list=None, extrinsics_list=None):
         x, meta = self._build_input_tensor(images)
+        intrinsics_for_input = self._scale_intrinsics_for_resized_inputs(
+            intrinsics_list=intrinsics_list,
+            orig_sizes=meta["orig_sizes"],
+        )
 
         inputs = []
         input_tensor = grpcclient.InferInput(self.input_name, x.shape, "FP32")
         input_tensor.set_data_from_numpy(x)
         inputs.append(input_tensor)
         K_tensor, E_tensor = self._build_pose_tensors(
-            intrinsics_list=intrinsics_list,
+            intrinsics_list=intrinsics_for_input,
             extrinsics_list=extrinsics_list,
             num_images=meta["num_images"],
         )
@@ -356,7 +387,7 @@ if __name__ == "__main__":
         result = da3.run(
             img_list,
             intrinsics_list=payload["intrinsics_list"],
-            extrinsics_list=payload["extrinsics_list"],
+            extrinsics_list=extrinsics_to_first_camera_frame(payload["extrinsics_list"]),
         )
         chunk_end_ms = time.time() * 1000.0
         logger.info(

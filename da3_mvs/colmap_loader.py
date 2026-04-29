@@ -849,6 +849,36 @@ def get_chunk_payload(images, cameras, chunk):
     }
 
 
+def extrinsics_to_first_camera_frame(extrinsics_list):
+    """
+    Re-express world-to-camera extrinsics into the first camera's frame.
+    After conversion, the first extrinsic becomes identity.
+    """
+    if len(extrinsics_list) == 0:
+        return []
+
+    exts = []
+    for i, ext in enumerate(extrinsics_list):
+        E = np.asarray(ext, dtype=np.float64)
+        if E.shape == (3, 4):
+            E44 = np.eye(4, dtype=np.float64)
+            E44[:3, :4] = E
+            E = E44
+        if E.shape != (4, 4):
+            raise ValueError(f"extrinsics_list[{i}] must be (4,4) or (3,4), got {E.shape}")
+        exts.append(E)
+
+    E0 = exts[0]
+    E0_inv = np.linalg.inv(E0)
+
+    # For a point X in original world frame:
+    # X_cam_i = E_i * X
+    # X_world0 = E0 * X  => X = E0_inv * X_world0
+    # Therefore X_cam_i = E_i * E0_inv * X_world0, so E_i' = E_i * E0_inv.
+    out = [(Ei @ E0_inv).astype(np.float64) for Ei in exts]
+    return out
+
+
 
 # python da3_mvs/colmap_loader.py ../EasyGaussianSplatting/data/insta360_test/sparse/0 --chunk-size 10 --min-shared-points 20
 if __name__ == "__main__":
