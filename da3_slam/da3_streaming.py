@@ -80,7 +80,7 @@ def build_default_pipeline() -> DA3StreamingMappingPipeline:
     )
 
 
-def resize_image(image, max_width=504):
+def resize_image(image, max_width=640):
     """
     Resize image while keeping aspect ratio.
     Only resizes if image width is greater than max_width.
