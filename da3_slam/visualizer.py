@@ -40,6 +40,7 @@ class Open3DTrajectoryVisualizer:
         tsdf_volume_unit_resolution: int = 16,
         tsdf_depth_sampling_stride: int = 1,
         tsdf_min_depth: float = 1e-4,
+        tsdf_min_confidence: float = 2.0,
         tsdf_use_pose_w2c_if_available: bool = True,
         max_live_chunks: int = 20,
     ):
@@ -69,6 +70,7 @@ class Open3DTrajectoryVisualizer:
         self.tsdf_volume_unit_resolution = int(tsdf_volume_unit_resolution)
         self.tsdf_depth_sampling_stride = int(tsdf_depth_sampling_stride)
         self.tsdf_min_depth = float(tsdf_min_depth)
+        self.tsdf_min_confidence = float(tsdf_min_confidence)
         self.tsdf_use_pose_w2c_if_available = bool(tsdf_use_pose_w2c_if_available)
         self.map_dir = None if map_dir is None else Path(map_dir)
         self.max_live_chunks = int(max(1, max_live_chunks))
@@ -497,14 +499,17 @@ class Open3DTrajectoryVisualizer:
             self._chunk_signatures.pop(chunk_id, None)
 
     def _make_chunk_signature(self, image_ids: Sequence[int], keyframe_dir: Path) -> Tuple:
-        signature: List[Tuple[int, float, float, float, float]] = []
+        signature: List[Tuple[int, float, float, float, float, float]] = []
         for image_id in image_ids:
             prefix = keyframe_dir / f"kf_{int(image_id):06d}"
             depth_mtime = self._safe_mtime(Path(str(prefix) + "_depth.npy"))
+            depth_conf_mtime = self._safe_mtime(Path(str(prefix) + "_depth_conf.npy"))
             intrinsics_mtime = self._safe_mtime(Path(str(prefix) + "_intrinsics.npy"))
             pose_w2c_mtime = self._safe_mtime(Path(str(prefix) + "_pose_w2c.npy"))
             pose_c2w_mtime = self._safe_mtime(Path(str(prefix) + "_pose_c2w.npy"))
-            signature.append((int(image_id), depth_mtime, intrinsics_mtime, pose_w2c_mtime, pose_c2w_mtime))
+            signature.append(
+                (int(image_id), depth_mtime, depth_conf_mtime, intrinsics_mtime, pose_w2c_mtime, pose_c2w_mtime)
+            )
         return tuple(signature)
 
     @staticmethod
@@ -534,6 +539,7 @@ class Open3DTrajectoryVisualizer:
                     keyframe_dir=keyframe_dir,
                     image_id=int(image_id),
                     min_depth=self.tsdf_min_depth,
+                    min_confidence=self.tsdf_min_confidence,
                     depth_trunc=self.tsdf_depth_trunc,
                     use_pose_w2c_if_available=self.tsdf_use_pose_w2c_if_available,
                 )

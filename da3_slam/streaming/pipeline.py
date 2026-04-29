@@ -274,16 +274,28 @@ class DA3StreamingMappingPipeline:
         da3_result = self.da3_client.run(job.images_bgr)
 
         depth_list = [np.asarray(d, dtype=np.float32) for d in da3_result["depth_list"]]
+        depth_conf_list_raw = da3_result.get("depth_conf_list", None)
+        if depth_conf_list_raw is None:
+            depth_conf_list = [np.ones_like(d, dtype=np.float32) for d in depth_list]
+        else:
+            depth_conf_list = [np.asarray(c, dtype=np.float32) for c in depth_conf_list_raw]
         intrinsics_list = [np.asarray(k, dtype=np.float32) for k in da3_result["intrinsics_list"]]
         extrinsics_list = [as_4x4(np.asarray(e, dtype=np.float32)) for e in da3_result["extrinsics_list"]]
 
-        if not (len(depth_list) == len(intrinsics_list) == len(extrinsics_list) == len(job.image_ids)):
+        if not (
+            len(depth_list)
+            == len(depth_conf_list)
+            == len(intrinsics_list)
+            == len(extrinsics_list)
+            == len(job.image_ids)
+        ):
             raise RuntimeError("DA3 output count does not match input keyframe count.")
 
         chunk = DA3ChunkRecord(
             chunk_id=job.chunk_id,
             image_ids=job.image_ids,
             depth_list=depth_list,
+            depth_conf_list=depth_conf_list,
             intrinsics_list=intrinsics_list,
             extrinsics_list=extrinsics_list,
             scale=1.0,
@@ -298,6 +310,7 @@ class DA3StreamingMappingPipeline:
                     continue
 
                 keyframe.depth = depth_list[local_idx]
+                keyframe.depth_conf = depth_conf_list[local_idx]
                 keyframe.intrinsics = intrinsics_list[local_idx]
                 keyframe.da3_local_w2c = extrinsics_list[local_idx]
                 keyframe.last_chunk_id = job.chunk_id
@@ -570,6 +583,11 @@ class DA3StreamingMappingPipeline:
                 return False
 
             target.depth = projected_depth.astype(np.float32)
+            target.depth_conf = np.where(
+                np.isfinite(projected_depth) & (projected_depth > 0.0),
+                1.0,
+                0.0,
+            ).astype(np.float32)
             target.intrinsics = target_intrinsics
             self.updated_keyframes.add(int(target_keyframe_id))
 

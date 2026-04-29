@@ -30,6 +30,7 @@ def build_open3d_tsdf_from_saved_keyframes(
     volume_unit_resolution: int = 16,
     depth_sampling_stride: int = 1,
     min_depth: float = 1e-4,
+    min_confidence: float = 0.0,
     use_pose_w2c_if_available: bool = True,
     verbose: bool = True,
 ) -> Tuple[o3d.geometry.TriangleMesh, o3d.geometry.PointCloud, Dict]:
@@ -135,6 +136,7 @@ def build_open3d_tsdf_from_saved_keyframes(
                 keyframe_dir=keyframe_dir,
                 image_id=image_id,
                 min_depth=min_depth,
+                min_confidence=min_confidence,
                 depth_trunc=depth_trunc,
                 use_pose_w2c_if_available=use_pose_w2c_if_available,
             )
@@ -214,6 +216,7 @@ def build_open3d_tsdf_from_saved_keyframes(
         "voxel_length": voxel_length,
         "sdf_trunc": sdf_trunc,
         "depth_trunc": depth_trunc,
+        "min_confidence": min_confidence,
     }
 
     return mesh, pcd, stats
@@ -260,6 +263,7 @@ def _load_keyframe_rgbd_camera(
     keyframe_dir: Path,
     image_id: int,
     min_depth: float,
+    min_confidence: float,
     depth_trunc: float,
     use_pose_w2c_if_available: bool,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -284,6 +288,7 @@ def _load_keyframe_rgbd_camera(
 
     rgb_path = Path(str(prefix) + "_rgb.png")
     depth_path = Path(str(prefix) + "_depth.npy")
+    depth_conf_path = Path(str(prefix) + "_depth_conf.npy")
     intrinsic_path = Path(str(prefix) + "_intrinsics.npy")
     pose_w2c_path = Path(str(prefix) + "_pose_w2c.npy")
     pose_c2w_path = Path(str(prefix) + "_pose_c2w.npy")
@@ -304,6 +309,9 @@ def _load_keyframe_rgbd_camera(
 
     depth = np.load(str(depth_path)).astype(np.float32)
     intrinsic = np.load(str(intrinsic_path)).astype(np.float64)
+    depth_conf = None
+    if depth_conf_path.exists():
+        depth_conf = np.load(str(depth_conf_path)).astype(np.float32)
 
     if color_rgb.shape[:2] != depth.shape[:2]:
         raise ValueError(
@@ -317,6 +325,12 @@ def _load_keyframe_rgbd_camera(
     depth[~np.isfinite(depth)] = 0.0
     depth[depth <= min_depth] = 0.0
     depth[depth >= depth_trunc] = 0.0
+    if depth_conf is not None:
+        if depth_conf.shape != depth.shape:
+            raise ValueError(f"depth/depth_conf size mismatch for kf {image_id}: {depth.shape} vs {depth_conf.shape}")
+        depth_conf = np.asarray(depth_conf, dtype=np.float32)
+        valid_conf = np.isfinite(depth_conf) & (depth_conf >= float(min_confidence))
+        depth[~valid_conf] = 0.0
 
     if use_pose_w2c_if_available and pose_w2c_path.exists():
         extrinsic_w2c = np.load(str(pose_w2c_path)).astype(np.float64)

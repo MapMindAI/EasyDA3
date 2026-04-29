@@ -148,7 +148,7 @@ def main() -> None:
             vis = visualize_optical_flow_result(image, result.flow_result)
 
             cv2.imshow("optical flow tracks", vis)
-            key = cv2.waitKey(30) & 0xFF
+            key = cv2.waitKey(10) & 0xFF
             if key == ord("q"):
                 quit_requested = True
                 break

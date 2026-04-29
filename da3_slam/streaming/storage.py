@@ -36,6 +36,19 @@ class StreamingMapStorage:
             if self.save_depth_png_preview:
                 depth_png = depth_to_u8(keyframe.depth)
                 cv2.imwrite(str(prefix) + "_depth_vis.png", depth_png)
+        else:
+            depth_png = None
+
+        conf_png = None
+        if keyframe.depth_conf is not None:
+            np.save(str(prefix) + "_depth_conf.npy", keyframe.depth_conf.astype(np.float32))
+            conf_png = (np.clip(np.asarray(keyframe.depth_conf, dtype=np.float32), 0.0, 1.0) * 255.0).astype(np.uint8)
+            if self.save_depth_png_preview:
+                cv2.imwrite(str(prefix) + "_depth_conf_vis.png", conf_png)
+
+        if self.save_depth_png_preview and depth_png is not None and conf_png is not None:
+            side_by_side = np.concatenate([depth_png, conf_png], axis=1)
+            cv2.imwrite(str(prefix) + "_depth_and_conf_vis.png", side_by_side)
 
         if keyframe.intrinsics is not None:
             np.save(str(prefix) + "_intrinsics.npy", keyframe.intrinsics.astype(np.float64))
@@ -51,10 +64,14 @@ class StreamingMapStorage:
             "source_frame_id": keyframe.source_frame_id,
             "last_chunk_id": keyframe.last_chunk_id,
             "has_depth": keyframe.depth is not None,
+            "has_depth_conf": keyframe.depth_conf is not None,
             "has_intrinsics": keyframe.intrinsics is not None,
             "has_pose": keyframe.pose_c2w is not None,
             "rgb_path": f"kf_{keyframe.image_id:06d}_rgb.png",
             "depth_path": f"kf_{keyframe.image_id:06d}_depth.npy" if keyframe.depth is not None else None,
+            "depth_conf_path": (
+                f"kf_{keyframe.image_id:06d}_depth_conf.npy" if keyframe.depth_conf is not None else None
+            ),
             "intrinsics_path": (
                 f"kf_{keyframe.image_id:06d}_intrinsics.npy" if keyframe.intrinsics is not None else None
             ),
@@ -105,11 +122,17 @@ class StreamingMapStorage:
                     "source_frame_id": keyframe.source_frame_id,
                     "last_chunk_id": keyframe.last_chunk_id,
                     "has_depth": keyframe.depth is not None,
+                    "has_depth_conf": keyframe.depth_conf is not None,
                     "has_intrinsics": keyframe.intrinsics is not None,
                     "has_pose": keyframe.pose_c2w is not None,
                     "rgb_path": f"keyframes/kf_{keyframe.image_id:06d}_rgb.png",
                     "depth_path": (
                         f"keyframes/kf_{keyframe.image_id:06d}_depth.npy" if keyframe.depth is not None else None
+                    ),
+                    "depth_conf_path": (
+                        f"keyframes/kf_{keyframe.image_id:06d}_depth_conf.npy"
+                        if keyframe.depth_conf is not None
+                        else None
                     ),
                     "intrinsics_path": (
                         f"keyframes/kf_{keyframe.image_id:06d}_intrinsics.npy"

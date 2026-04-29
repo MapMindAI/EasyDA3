@@ -30,11 +30,13 @@ def merge_rgbd_to_pointcloud_numpy(
     depth_list,
     intrinsics_list,
     extrinsics_list,
+    depth_conf_list=None,
     rgb_list=None,
     depth_scale=1.0,
     min_depth=1e-6,
     max_depth=None,
     sample_stride=1,
+    min_confidence=0.0,
 ):
     """
     Merge multiple RGBD frames into one world-space point cloud using only NumPy.
@@ -59,6 +61,8 @@ def merge_rgbd_to_pointcloud_numpy(
 
     if rgb_list is not None and len(rgb_list) != len(depth_list):
         raise ValueError("rgb_list must have same length as depth_list")
+    if depth_conf_list is not None and len(depth_conf_list) != len(depth_list):
+        raise ValueError("depth_conf_list must have same length as depth_list")
 
     all_points = []
     all_colors = []
@@ -67,6 +71,7 @@ def merge_rgbd_to_pointcloud_numpy(
         depth = np.asarray(depth_list[i], dtype=np.float32) * depth_scale
         K = np.asarray(intrinsics_list[i], dtype=np.float32)
         ext = np.asarray(extrinsics_list[i], dtype=np.float32)
+        conf = None if depth_conf_list is None else np.asarray(depth_conf_list[i], dtype=np.float32)
 
         if depth.ndim != 2:
             raise ValueError(f"depth_list[{i}] must have shape (H, W), got {depth.shape}")
@@ -81,6 +86,8 @@ def merge_rgbd_to_pointcloud_numpy(
             raise ValueError(f"extrinsics_list[{i}] must have shape (3, 4) or (4, 4), got {ext.shape}")
 
         H, W = depth.shape
+        if conf is not None and conf.shape != (H, W):
+            raise ValueError(f"depth_conf_list[{i}] must have shape {(H, W)}, got {conf.shape}")
 
         if rgb_list is not None:
             rgb = np.asarray(rgb_list[i])
@@ -109,6 +116,8 @@ def merge_rgbd_to_pointcloud_numpy(
         valid = np.isfinite(depth) & (depth > min_depth) & stride_mask
         if max_depth is not None:
             valid &= depth < max_depth
+        if conf is not None:
+            valid &= np.isfinite(conf) & (conf >= float(min_confidence))
 
         if not np.any(valid):
             continue
@@ -225,6 +234,7 @@ class DepthAnything3:
 
         self.desired_outputs = [
             grpcclient.InferRequestedOutput("depth"),
+            grpcclient.InferRequestedOutput("depth_conf"),
             grpcclient.InferRequestedOutput("intrinsics"),
             grpcclient.InferRequestedOutput("extrinsics"),
         ]
@@ -331,6 +341,7 @@ class DepthAnything3:
         )
 
         depth = self.get_response(response, "depth")
+        depth_conf = self.get_response(response, "depth_conf")
         extrinsics = self.get_response(response, "extrinsics")
         intrinsics = self.get_response(response, "intrinsics")
 
@@ -341,18 +352,24 @@ class DepthAnything3:
         num_images = meta["num_images"]
         if depth.shape[1] != num_images:
             raise ValueError(f"Output image count mismatch: input has {num_images}, output has {depth.shape[1]}")
+        if depth_conf.shape != depth.shape:
+            raise ValueError(f"Unexpected depth_conf output shape: {depth_conf.shape}, expected {depth.shape}")
 
         depth_list = []
+        depth_conf_list = []
         intrinsics_list = []
         extrinsics_list = []
 
         for i in range(num_images):
             depth_i = depth[0, i]
+            depth_conf_i = depth_conf[0, i]
             orig_h, orig_w = meta["orig_sizes"][i]
             factor_x = orig_w / depth_i.shape[1]
             factor_y = orig_h / depth_i.shape[0]
             depth_i_resized = cv2.resize(depth_i, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+            depth_conf_i_resized = cv2.resize(depth_conf_i, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
             depth_list.append(depth_i_resized)
+            depth_conf_list.append(depth_conf_i_resized.astype(np.float32))
             intri = intrinsics[0, i].copy()
             intri[0, 0] *= factor_x
             intri[0, 2] *= factor_x
@@ -366,6 +383,7 @@ class DepthAnything3:
 
         return {
             "depth_list": depth_list,  # list of HxW
+            "depth_conf_list": depth_conf_list,  # list of HxW
             "intrinsics_list": intrinsics_list,  # list of 3x3
             "extrinsics_list": extrinsics_list,  # list of 3x4
         }
@@ -386,9 +404,17 @@ class DepthAnything3:
     def save_visualizations(self, result, prefix="depth"):
         for i, depth_i in enumerate(result["depth_list"]):
             depth_i_vis = self._depth_to_vis(depth_i)
+            conf_i = None
+            if "depth_conf_list" in result and i < len(result["depth_conf_list"]):
+                conf_i = np.asarray(result["depth_conf_list"][i], dtype=np.float32)
             save_path = f"{prefix}_{i}.png"
             depth_u8 = (np.clip(depth_i_vis, 0, 1) * 255).astype(np.uint8)
-            cv2.imwrite(save_path, depth_u8)
+            if conf_i is not None:
+                conf_u8 = (np.clip(conf_i, 0.0, 10.0) * 25).astype(np.uint8)
+                vis = np.concatenate([depth_u8, conf_u8], axis=1)
+            else:
+                vis = depth_u8
+            cv2.imwrite(save_path, vis)
             logger.info("Saved %s", save_path)
 
 
@@ -418,9 +444,11 @@ if __name__ == "__main__":
         depth_list=result["depth_list"],
         intrinsics_list=result["intrinsics_list"],
         extrinsics_list=result["extrinsics_list"],
+        depth_conf_list=result.get("depth_conf_list", None),
         rgb_list=images,
         min_depth=0.01,
         max_depth=100.0,
         sample_stride=4,
+        min_confidence=2.0,
     )
     save_pointcloud_ply("data/cloud.ply", points, colors)

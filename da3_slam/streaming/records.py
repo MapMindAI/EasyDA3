@@ -13,6 +13,7 @@ class KeyframeRecord:
     image_bgr: np.ndarray
 
     depth: Optional[np.ndarray] = None
+    depth_conf: Optional[np.ndarray] = None
     intrinsics: Optional[np.ndarray] = None
 
     pose_c2w: Optional[np.ndarray] = None
@@ -28,6 +29,7 @@ class DA3ChunkRecord:
     image_ids: List[int]
 
     depth_list: List[np.ndarray]
+    depth_conf_list: List[np.ndarray]
     intrinsics_list: List[np.ndarray]
     extrinsics_list: List[np.ndarray]
 
