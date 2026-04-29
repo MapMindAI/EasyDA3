@@ -43,3 +43,9 @@ gtsam
 pytest
 tritonclient
 logging
+
+
+
+TODO:
+* filter too close current tracks in optical flow track.
+* each chunk as a TSDF, and show together in open3d viz.

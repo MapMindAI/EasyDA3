@@ -174,6 +174,116 @@ def transform_points_c2w(points_cam: np.ndarray, pose_c2w: np.ndarray) -> np.nda
     return points_cam @ R.T + t[None, :]
 
 
+def transform_points_w2c(points_world: np.ndarray, pose_c2w: np.ndarray) -> np.ndarray:
+    """
+    Transform 3D points from world coordinates to camera coordinates.
+
+    pose_c2w:
+        shape (4, 4)
+        maps camera coordinates to world coordinates
+    """
+    pose_w2c = np.linalg.inv(as_4x4(pose_c2w))
+    R = pose_w2c[:3, :3]
+    t = pose_w2c[:3, 3]
+
+    return points_world @ R.T + t[None, :]
+
+
+def project_depth_to_frame(
+    depth_src: np.ndarray,
+    intrinsics_src: np.ndarray,
+    pose_c2w_src: np.ndarray,
+    intrinsics_dst: np.ndarray,
+    pose_c2w_dst: np.ndarray,
+    dst_shape,
+    min_depth: float = 1e-6,
+    max_depth: float | None = None,
+    splat_radius: int = 1,
+) -> np.ndarray:
+    """
+    Forward-project a source keyframe depth map into a destination camera.
+
+    The result is a z-buffered destination depth map in destination camera
+    coordinates. Pixels without projected support are NaN.
+    """
+
+    depth_src = np.asarray(depth_src, dtype=np.float32)
+    if depth_src.ndim != 2:
+        raise ValueError("depth_src must be a single-channel depth map with shape (H, W)")
+
+    if len(dst_shape) < 2:
+        raise ValueError("dst_shape must contain at least height and width")
+
+    dst_h = int(dst_shape[0])
+    dst_w = int(dst_shape[1])
+    if dst_h <= 0 or dst_w <= 0:
+        raise ValueError(f"invalid destination shape: {dst_shape}")
+
+    K_src = intrinsics_to_K(intrinsics_src)
+    K_dst = intrinsics_to_K(intrinsics_dst)
+    pose_c2w_src = as_4x4(pose_c2w_src)
+    pose_c2w_dst = as_4x4(pose_c2w_dst)
+
+    valid = np.isfinite(depth_src) & (depth_src > min_depth)
+    if max_depth is not None:
+        valid &= depth_src < max_depth
+
+    ys, xs = np.nonzero(valid)
+    if len(xs) == 0:
+        return np.full((dst_h, dst_w), np.nan, dtype=np.float32)
+
+    zs = depth_src[ys, xs].astype(np.float64)
+    pts_src_cam = backproject_pixels_to_camera(xs.astype(np.float64), ys.astype(np.float64), zs, K_src)
+    pts_world = transform_points_c2w(pts_src_cam, pose_c2w_src)
+    pts_dst_cam = transform_points_w2c(pts_world, pose_c2w_dst)
+
+    z_dst = pts_dst_cam[:, 2]
+    valid_dst = np.isfinite(z_dst) & (z_dst > min_depth)
+    if max_depth is not None:
+        valid_dst &= z_dst < max_depth
+
+    pts_dst_cam = pts_dst_cam[valid_dst]
+    z_dst = z_dst[valid_dst]
+    if len(z_dst) == 0:
+        return np.full((dst_h, dst_w), np.nan, dtype=np.float32)
+
+    u = K_dst[0, 0] * (pts_dst_cam[:, 0] / z_dst) + K_dst[0, 2]
+    v = K_dst[1, 1] * (pts_dst_cam[:, 1] / z_dst) + K_dst[1, 2]
+
+    px = np.rint(u).astype(np.int64)
+    py = np.rint(v).astype(np.int64)
+    inside = (px >= 0) & (px < dst_w) & (py >= 0) & (py < dst_h)
+
+    if not np.any(inside):
+        return np.full((dst_h, dst_w), np.nan, dtype=np.float32)
+
+    px = px[inside]
+    py = py[inside]
+    z_dst = z_dst[inside].astype(np.float32)
+
+    z_buffer = np.full((dst_h, dst_w), np.inf, dtype=np.float32)
+    radius = max(0, int(splat_radius))
+
+    for dy in range(-radius, radius + 1):
+        yy = py + dy
+        y_ok = (yy >= 0) & (yy < dst_h)
+
+        if not np.any(y_ok):
+            continue
+
+        for dx in range(-radius, radius + 1):
+            xx = px + dx
+            ok = y_ok & (xx >= 0) & (xx < dst_w)
+
+            if not np.any(ok):
+                continue
+
+            np.minimum.at(z_buffer, (yy[ok], xx[ok]), z_dst[ok])
+
+    z_buffer[~np.isfinite(z_buffer)] = np.nan
+    return z_buffer
+
+
 def invert_pose_w2c_to_c2w(R_w2c: np.ndarray, t_w2c: np.ndarray) -> np.ndarray:
     """
     OpenCV solvePnP returns world-to-camera:

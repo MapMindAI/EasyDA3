@@ -80,6 +80,29 @@ def build_default_pipeline() -> DA3StreamingMappingPipeline:
     )
 
 
+def resize_image(image, max_width=504):
+    """
+    Resize image while keeping aspect ratio.
+    Only resizes if image width is greater than max_width.
+    """
+    height, width = image.shape[:2]
+
+    if width <= max_width:
+        return image
+
+    scale = max_width / width
+    new_width = max_width
+    new_height = int(height * scale)
+
+    resized = cv2.resize(
+        image,
+        (new_width, new_height),
+        interpolation=cv2.INTER_AREA
+    )
+
+    return resized
+
+
 def main() -> None:
     configure_logging()
 
@@ -94,7 +117,7 @@ def main() -> None:
 
     import glob
 
-    image_files = glob.glob("data/cam0-20260427T031458Z-3-001/cam0/data/*.png")
+    image_files = glob.glob("data/AmsterdamMorningDrive/*.png")
     image_files.sort()
 
     quit_requested = False
@@ -102,6 +125,7 @@ def main() -> None:
     try:
         for image_file in image_files:
             image = cv2.imread(image_file)
+            image = resize_image(image)
 
             result = pipeline.process_image(image)
             traj_vis.update_from_pipeline(pipeline)

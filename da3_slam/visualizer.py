@@ -23,8 +23,8 @@ class Open3DTrajectoryVisualizer:
         window_title: str = "DA3-SLAM Trajectory",
         camera_size: float = 0.25,
         trajectory_color=(0.1, 0.55, 1.0),
-        current_camera_color=(1.0, 0.15, 0.05),
-        history_camera_color=(0.35, 0.35, 0.35),
+        current_camera_color=(0.0, 0.0, 0.0),
+        history_camera_color=(0.0, 0.0, 0.0),
         draw_history_camera_stride: int = 10,
     ):
         """
@@ -46,6 +46,7 @@ class Open3DTrajectoryVisualizer:
 
         self._lock = threading.Lock()
         self._poses_c2w: Dict[int, np.ndarray] = {}
+        self._current_pose_c2w: Optional[np.ndarray] = None
         self._latest_frame_id: Optional[int] = None
         self._latest_keyframe_id: Optional[int] = None
         self._latest_chunk_id: Optional[int] = None
@@ -57,7 +58,7 @@ class Open3DTrajectoryVisualizer:
         self._trajectory = o3d.geometry.LineSet()
         self._current_camera = o3d.geometry.LineSet()
         self._history_cameras = o3d.geometry.LineSet()
-        self._origin = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
+        self._origin = self._make_camera_coordinate_origin_axes(axis_size=0.5)
         self._geometry_added = False
 
     def start(self):
@@ -78,6 +79,7 @@ class Open3DTrajectoryVisualizer:
         snapshot = pipeline.get_trajectory_snapshot()
         self.update_snapshot(
             poses_c2w=snapshot["poses_c2w"],
+            current_pose_c2w=snapshot.get("current_pose_c2w"),
             latest_frame_id=snapshot["frame_id"],
             latest_keyframe_id=snapshot["latest_keyframe_id"],
             latest_chunk_id=snapshot["latest_chunk_id"],
@@ -86,12 +88,16 @@ class Open3DTrajectoryVisualizer:
     def update_snapshot(
         self,
         poses_c2w: Dict[int, np.ndarray],
+        current_pose_c2w: Optional[np.ndarray] = None,
         latest_frame_id: Optional[int] = None,
         latest_keyframe_id: Optional[int] = None,
         latest_chunk_id: Optional[int] = None,
     ):
         with self._lock:
             self._poses_c2w = {int(k): np.asarray(v, dtype=np.float64).copy() for k, v in poses_c2w.items()}
+            self._current_pose_c2w = (
+                None if current_pose_c2w is None else np.asarray(current_pose_c2w, dtype=np.float64).copy()
+            )
             self._latest_frame_id = latest_frame_id
             self._latest_keyframe_id = latest_keyframe_id
             self._latest_chunk_id = latest_chunk_id
@@ -122,7 +128,7 @@ class Open3DTrajectoryVisualizer:
 
     def _setup_scene(self):
         render_option = self._vis.get_render_option()
-        render_option.background_color = np.array([0.02, 0.02, 0.025], dtype=np.float64)
+        render_option.background_color = np.array([1.0, 1.0, 1.0], dtype=np.float64)
         render_option.line_width = 3.0
         render_option.point_size = 5.0
 
@@ -135,6 +141,7 @@ class Open3DTrajectoryVisualizer:
     def _draw_once(self):
         with self._lock:
             poses = {k: v.copy() for k, v in self._poses_c2w.items()}
+            current_pose_c2w = None if self._current_pose_c2w is None else self._current_pose_c2w.copy()
             latest_frame_id = self._latest_frame_id
             latest_keyframe_id = self._latest_keyframe_id
             latest_chunk_id = self._latest_chunk_id
@@ -146,7 +153,8 @@ class Open3DTrajectoryVisualizer:
         trajectory_points = np.array([poses[i][:3, 3] for i in ids], dtype=np.float64)
 
         self._update_trajectory(trajectory_points)
-        self._update_current_camera(poses[ids[-1]])
+        pose_for_current_camera = poses[ids[-1]] if current_pose_c2w is None else current_pose_c2w
+        self._update_current_camera(pose_for_current_camera)
         self._update_history_cameras([poses[i] for i in ids])
         self._update_window_title(
             pose_count=len(ids),
@@ -282,6 +290,47 @@ class Open3DTrajectoryVisualizer:
         lineset.points = o3d.utility.Vector3dVector(points)
         lineset.lines = o3d.utility.Vector2iVector(lines)
         lineset.colors = o3d.utility.Vector3dVector(colors)
+
+    @staticmethod
+    def _make_camera_coordinate_origin_axes(axis_size: float) -> o3d.geometry.LineSet:
+        """
+        Camera-coordinate origin axes:
+            X: right
+            Y: down
+            Z: front
+        """
+        s = float(axis_size)
+        points = np.array(
+            [
+                [0.0, 0.0, 0.0],  # origin
+                [s, 0.0, 0.0],  # +X (right)
+                [0.0, -s, 0.0],  # +Y (down)
+                [0.0, 0.0, s],  # +Z (front)
+            ],
+            dtype=np.float64,
+        )
+        lines = np.array(
+            [
+                [0, 1],
+                [0, 2],
+                [0, 3],
+            ],
+            dtype=np.int32,
+        )
+        colors = np.array(
+            [
+                [1.0, 0.0, 0.0],  # X red
+                [0.0, 1.0, 0.0],  # Y green
+                [0.1, 0.35, 1.0],  # Z blue
+            ],
+            dtype=np.float64,
+        )
+
+        axes = o3d.geometry.LineSet()
+        axes.points = o3d.utility.Vector3dVector(points)
+        axes.lines = o3d.utility.Vector2iVector(lines)
+        axes.colors = o3d.utility.Vector3dVector(colors)
+        return axes
 
 
 # Compatibility for old imports. The implementation is now Open3D-based.

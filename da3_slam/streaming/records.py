@@ -71,3 +71,14 @@ class MappingProcessResult:
     backend_error: Optional[str] = None
 
     flow_result: Any = None
+
+    estimated_pose_c2w: Optional[np.ndarray] = None
+    estimated_pose_w2c: Optional[np.ndarray] = None
+    pose_reference_keyframe_id: Optional[int] = None
+    pose_reference_source_frame_id: Optional[int] = None
+    pose_estimation_info: Optional[Any] = None
+    pose_estimation_error: Optional[str] = None
+
+    projected_depth_keyframe_id: Optional[int] = None
+    projected_depth_source_keyframe_id: Optional[int] = None
+    projected_depth_valid_pixels: int = 0

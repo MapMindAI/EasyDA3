@@ -39,7 +39,7 @@ OPTICAL_FLOW_THRESHOLD_PRESETS = {
         "min_tracked_features": 150,
         "min_radial_scale_tracks": 30,
         "radial_scale_min_radius": 20.0,
-        "feature_replenish_radius": 10,
+        "feature_replenish_radius": 15,
     },
     "loose": {
         "max_features": 800,
@@ -49,7 +49,7 @@ OPTICAL_FLOW_THRESHOLD_PRESETS = {
         "min_tracked_features": 100,
         "min_radial_scale_tracks": 25,
         "radial_scale_min_radius": 20.0,
-        "feature_replenish_radius": 12,
+        "feature_replenish_radius": 20,
     },
 }
 
@@ -70,6 +70,7 @@ class OpticalFlowResult:
     mean_radial_scale_change: float = 0.0
     keyframe_reason: str = ""
     num_new_features: int = 0
+    num_pruned_features: int = 0
 
 
 class OpticalFlowKeyframeProcessor:
@@ -85,6 +86,7 @@ class OpticalFlowKeyframeProcessor:
         min_radial_scale_tracks: int = 30,
         radial_scale_min_radius: float = 20.0,
         feature_replenish_radius=None,
+        tracked_feature_prune_radius=None,
         lk_win_size=(21, 21),
         lk_max_level: int = 3,
         lk_max_iter: int = 30,
@@ -134,6 +136,11 @@ class OpticalFlowKeyframeProcessor:
                 features in blank areas after a keyframe promotion. Defaults to
                 min_feature_distance.
 
+            tracked_feature_prune_radius:
+                Minimum spacing between surviving tracked points in the current
+                frame. This removes clustered tracks before they can occupy the
+                new keyframe feature budget. Defaults to min_feature_distance.
+
             lk_win_size:
                 Lucas-Kanade optical flow window size.
 
@@ -157,6 +164,9 @@ class OpticalFlowKeyframeProcessor:
         self.min_feature_distance = int(min_feature_distance)
         self.feature_replenish_radius = (
             self.min_feature_distance if feature_replenish_radius is None else int(feature_replenish_radius)
+        )
+        self.tracked_feature_prune_radius = (
+            self.min_feature_distance if tracked_feature_prune_radius is None else int(tracked_feature_prune_radius)
         )
 
         self.feature_params = dict(
@@ -288,7 +298,16 @@ class OpticalFlowKeyframeProcessor:
         status = status.reshape(-1).astype(bool)
         next_pts = next_pts.reshape(-1, 2)
 
-        valid = status
+        height, width = gray.shape[:2]
+        valid = (
+            status
+            & np.isfinite(next_pts[:, 0])
+            & np.isfinite(next_pts[:, 1])
+            & (next_pts[:, 0] >= 0)
+            & (next_pts[:, 0] < width)
+            & (next_pts[:, 1] >= 0)
+            & (next_pts[:, 1] < height)
+        )
 
         if self.use_forward_backward_check:
             back_pts, back_status, _ = cv2.calcOpticalFlowPyrLK(
@@ -312,6 +331,9 @@ class OpticalFlowKeyframeProcessor:
 
         key_pts_valid = self.keyframe_points[valid]
         cur_pts_valid = next_pts[valid]
+        num_tracks_before_prune = len(cur_pts_valid)
+        key_pts_valid, cur_pts_valid = self._prune_close_tracks(key_pts_valid, cur_pts_valid)
+        num_pruned_features = num_tracks_before_prune - len(cur_pts_valid)
 
         tracks = np.hstack([key_pts_valid, cur_pts_valid]).astype(np.float32)
 
@@ -370,6 +392,7 @@ class OpticalFlowKeyframeProcessor:
             mean_radial_scale_change=mean_radial_scale_change,
             keyframe_reason="+".join(keyframe_reasons),
             num_new_features=num_new_features,
+            num_pruned_features=num_pruned_features,
         )
 
     def _initialize(self, gray: np.ndarray):
@@ -388,6 +411,7 @@ class OpticalFlowKeyframeProcessor:
             num_new_features = len(pts)
         else:
             seed_points = self._filter_points_in_bounds(seed_points, gray.shape)
+            seed_points = self._prune_close_points(seed_points, self.tracked_feature_prune_radius)
             pts, num_new_features = self._replenish_features(gray, seed_points)
 
         self.keyframe_points = pts
@@ -408,6 +432,8 @@ class OpticalFlowKeyframeProcessor:
         return pts.reshape(-1, 2).astype(np.float32)
 
     def _replenish_features(self, gray: np.ndarray, seed_points: np.ndarray) -> Tuple[np.ndarray, int]:
+        seed_points = self._prune_close_points(seed_points, self.tracked_feature_prune_radius)
+
         if len(seed_points) >= self.max_features:
             return seed_points[: self.max_features].astype(np.float32), 0
 
@@ -420,6 +446,74 @@ class OpticalFlowKeyframeProcessor:
 
         pts = np.vstack([seed_points, new_points]).astype(np.float32)
         return pts, len(new_points)
+
+    def _prune_close_tracks(
+        self,
+        key_points: np.ndarray,
+        current_points: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if len(current_points) <= 1:
+            return key_points.astype(np.float32), current_points.astype(np.float32)
+
+        keep = self._select_spatially_distinct_indices(current_points, self.tracked_feature_prune_radius)
+        return key_points[keep].astype(np.float32), current_points[keep].astype(np.float32)
+
+    @staticmethod
+    def _prune_close_points(points: np.ndarray, min_distance: float) -> np.ndarray:
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+
+        if len(points) <= 1:
+            return points.astype(np.float32)
+
+        keep = OpticalFlowKeyframeProcessor._select_spatially_distinct_indices(points, min_distance)
+        return points[keep].astype(np.float32)
+
+    @staticmethod
+    def _select_spatially_distinct_indices(points: np.ndarray, min_distance: float) -> np.ndarray:
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+
+        if len(points) == 0:
+            return np.empty((0,), dtype=np.int64)
+
+        min_distance = float(min_distance)
+        if min_distance <= 0.0:
+            return np.arange(len(points), dtype=np.int64)
+
+        cell_size = min_distance
+        min_distance_sq = min_distance * min_distance
+        selected = []
+        grid = {}
+
+        for idx, (x, y) in enumerate(points):
+            if not np.isfinite(x) or not np.isfinite(y):
+                continue
+
+            cell_x = int(np.floor(x / cell_size))
+            cell_y = int(np.floor(y / cell_size))
+            too_close = False
+
+            for neighbor_y in range(cell_y - 1, cell_y + 2):
+                for neighbor_x in range(cell_x - 1, cell_x + 2):
+                    for selected_idx in grid.get((neighbor_x, neighbor_y), []):
+                        dx = float(x - points[selected_idx, 0])
+                        dy = float(y - points[selected_idx, 1])
+                        if dx * dx + dy * dy < min_distance_sq:
+                            too_close = True
+                            break
+
+                    if too_close:
+                        break
+
+                if too_close:
+                    break
+
+            if too_close:
+                continue
+
+            grid.setdefault((cell_x, cell_y), []).append(idx)
+            selected.append(idx)
+
+        return np.asarray(selected, dtype=np.int64)
 
     def _make_blank_area_mask(self, image_shape, existing_points: np.ndarray) -> np.ndarray:
         height, width = image_shape[:2]
@@ -613,7 +707,10 @@ def visualize_optical_flow_result(
             )
 
     if draw_text:
-        text_1 = f"tracks: {len(tracks)}"
+        pruned = int(getattr(result, "num_pruned_features", 0))
+        text_1 = f"tracks: {result.num_tracks}"
+        if pruned > 0:
+            text_1 += f", pruned: {pruned}"
         text_2 = f"median motion: {result.median_pixel_motion:.2f}px"
         text_3 = f"radial scale: {result.median_radial_scale_change:.3f}"
         text_4 = f"keyframe: {result.is_keyframe} {result.keyframe_reason}"
@@ -727,13 +824,14 @@ if __name__ == "__main__":
         if result.is_keyframe:
             logger.info(
                 "New keyframe at frame %s, reason=%s, tracks=%s, "
-                "median motion=%.2fpx, radial scale=%.3f, new features=%s",
+                "median motion=%.2fpx, radial scale=%.3f, new features=%s, pruned=%s",
                 result.frame_id,
                 result.keyframe_reason,
                 result.num_tracks,
                 result.median_pixel_motion,
                 result.median_radial_scale_change,
                 result.num_new_features,
+                result.num_pruned_features,
             )
         # tracks[:, 0:2] are feature positions in the last keyframe
         # tracks[:, 2:4] are corresponding feature positions in current frame
