@@ -15,6 +15,7 @@ try:
         DA3BackendJob,
         DA3BackendResult,
         DA3ChunkRecord,
+        DA3SequentialPairMappingPipeline,
         DA3StreamingMappingPipeline,
         KeyframeRecord,
         MappingProcessResult,
@@ -33,6 +34,7 @@ except ImportError:
         DA3BackendJob,
         DA3BackendResult,
         DA3ChunkRecord,
+        DA3SequentialPairMappingPipeline,
         DA3StreamingMappingPipeline,
         KeyframeRecord,
         MappingProcessResult,
@@ -46,6 +48,7 @@ __all__ = [
     "DA3BackendJob",
     "DA3BackendResult",
     "DA3ChunkRecord",
+    "DA3SequentialPairMappingPipeline",
     "DA3StreamingMappingPipeline",
     "KeyframeRecord",
     "MappingProcessResult",
@@ -80,6 +83,31 @@ def build_default_pipeline() -> DA3StreamingMappingPipeline:
     )
 
 
+def build_sequential_pair_pipeline() -> DA3SequentialPairMappingPipeline:
+    flow_processor = create_optical_flow_processor("loose")
+
+    da3_client = DepthAnything3(
+        triton_url="0.0.0.0:8001",
+        expected_num_images=None,
+    )
+
+    pose_optimizer = DA3ChunkPoseGraphOptimizer(
+        input_pose_is_w2c=True,
+        relative_rotation_sigma=0.03,
+        relative_translation_sigma=0.05,
+        max_iterations=100,
+    )
+
+    return DA3SequentialPairMappingPipeline(
+        flow_processor=flow_processor,
+        da3_client=da3_client,
+        pose_graph_optimizer=pose_optimizer,
+        output_dir="output_da3_map_seq_pair",
+        optimizer_num_chunks=4,
+        backend_queue_size=4,
+    )
+
+
 def resize_image(image, max_width=640):
     """
     Resize image while keeping aspect ratio.
@@ -106,18 +134,19 @@ def resize_image(image, max_width=640):
 def main() -> None:
     configure_logging()
 
-    pipeline = build_default_pipeline()
+    pipeline = build_sequential_pair_pipeline()
 
     traj_vis = Open3DTrajectoryVisualizer(
         update_hz=5.0,
         window_title="DA3-SLAM Open3D Trajectory",
         camera_size=0.25,
+        max_live_chunks=100,
     )
     traj_vis.start()
 
     import glob
 
-    image_files = glob.glob("data/AmsterdamMorningDrive/*.png")
+    image_files = glob.glob("data/office/*.png")
     image_files.sort()
 
     quit_requested = False
@@ -148,7 +177,7 @@ def main() -> None:
             vis = visualize_optical_flow_result(image, result.flow_result)
 
             cv2.imshow("optical flow tracks", vis)
-            key = cv2.waitKey(10) & 0xFF
+            key = cv2.waitKey(100) & 0xFF
             if key == ord("q"):
                 quit_requested = True
                 break

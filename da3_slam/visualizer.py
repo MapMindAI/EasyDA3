@@ -40,7 +40,7 @@ class Open3DTrajectoryVisualizer:
         tsdf_volume_unit_resolution: int = 16,
         tsdf_depth_sampling_stride: int = 1,
         tsdf_min_depth: float = 1e-4,
-        tsdf_min_confidence: float = 2.0,
+        tsdf_min_confidence: float = 1.0,
         tsdf_use_pose_w2c_if_available: bool = True,
         max_live_chunks: int = 20,
         follow_smoothing_alpha: float = 0.18,
