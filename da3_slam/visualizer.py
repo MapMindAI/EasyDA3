@@ -40,7 +40,7 @@ class Open3DTrajectoryVisualizer:
         tsdf_volume_unit_resolution: int = 16,
         tsdf_depth_sampling_stride: int = 1,
         tsdf_min_depth: float = 1e-4,
-        tsdf_min_confidence: float = 2.0,
+        tsdf_min_confidence: float = 1.5,
         tsdf_use_pose_w2c_if_available: bool = True,
         max_live_chunks: int = 20,
         follow_smoothing_alpha: float = 0.18,
@@ -306,7 +306,8 @@ class Open3DTrajectoryVisualizer:
         self._follow_smoothed_lookat = None
 
     def _init_follow_anchor(self, vc, pose_c2w: np.ndarray):
-        self._follow_reference_pose_c2w = np.asarray(pose_c2w, dtype=np.float64).copy()
+        pose_c2w = np.asarray(pose_c2w, dtype=np.float64)
+        self._follow_reference_pose_c2w = pose_c2w.copy()
 
         lookat = None
 
@@ -318,6 +319,19 @@ class Open3DTrajectoryVisualizer:
 
         if lookat is None:
             lookat = np.asarray(pose_c2w[:3, 3], dtype=np.float64)
+
+        # Align the virtual render camera orientation to SLAM camera convention:
+        # CV camera frame is +x right, +y down, +z forward. Open3D view uses +up.
+        # We therefore set: front = +z_forward, up = -y_down.
+        try:
+            rot = pose_c2w[:3, :3]
+            front = self._normalize_vec(rot[:, 2])
+            up = self._normalize_vec(-rot[:, 1])
+            if front is not None and up is not None:
+                vc.set_front(front)
+                vc.set_up(up)
+        except Exception:
+            pass
 
         self._follow_reference_lookat = lookat
         self._follow_smoothed_lookat = lookat.copy()
@@ -444,6 +458,14 @@ class Open3DTrajectoryVisualizer:
         lineset.points = o3d.utility.Vector3dVector(points)
         lineset.lines = o3d.utility.Vector2iVector(lines)
         lineset.colors = o3d.utility.Vector3dVector(colors)
+
+    @staticmethod
+    def _normalize_vec(v: np.ndarray) -> Optional[np.ndarray]:
+        vec = np.asarray(v, dtype=np.float64).reshape(3)
+        norm = float(np.linalg.norm(vec))
+        if not np.isfinite(norm) or norm < 1e-12:
+            return None
+        return vec / norm
 
     def _update_live_chunk_tsdf_meshes(self):
         if not self.live_chunk_tsdf or self.map_dir is None:

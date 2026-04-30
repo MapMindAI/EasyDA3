@@ -21,6 +21,7 @@ Docker image will be downloaded, onnx model will be transformed to triton plan f
 visual odometry using depthanything 3
 * optical flow to get keyframes.
 * run DA3 for all key frames if new keyframes (half DA3 input images size) added.
+* [See detailed read me](da3_slam/README.md)
 
 **Use optical-flow VO as the real-time frontend, and use DA3 as a delayed local-geometry backend.**
 DA3 should generate high-quality depth/pose constraints per chunk; pose graph optimization will integrate those constraints globally.
@@ -44,6 +45,7 @@ flowchart LR
 
 ![da3 slam](assets/da3_slam.gif)
 
+https://github.com/user-attachments/assets/f1f491ab-0dff-4e5b-be26-8ef0510b5a17
 
 # DA3 MVS
 

@@ -35,16 +35,16 @@ class StreamingMapStorage:
 
             if self.save_depth_png_preview:
                 depth_png = depth_to_u8(keyframe.depth)
-                cv2.imwrite(str(prefix) + "_depth_vis.png", depth_png)
+                # cv2.imwrite(str(prefix) + "_depth_vis.png", depth_png)
         else:
             depth_png = None
 
         conf_png = None
         if keyframe.depth_conf is not None:
             np.save(str(prefix) + "_depth_conf.npy", keyframe.depth_conf.astype(np.float32))
-            conf_png = (np.clip(np.asarray(keyframe.depth_conf, dtype=np.float32), 0.0, 1.0) * 255.0).astype(np.uint8)
-            if self.save_depth_png_preview:
-                cv2.imwrite(str(prefix) + "_depth_conf_vis.png", conf_png)
+            conf_png = (np.clip(np.asarray(keyframe.depth_conf, dtype=np.float32), 0.0, 10.0) * 25.5).astype(np.uint8)
+            # if self.save_depth_png_preview:
+            #     cv2.imwrite(str(prefix) + "_depth_conf_vis.png", conf_png)
 
         if self.save_depth_png_preview and depth_png is not None and conf_png is not None:
             side_by_side = np.concatenate([depth_png, conf_png], axis=1)

@@ -748,3 +748,84 @@ class DA3StreamingMappingPipeline:
             keyframes=keyframes,
             chunks=chunks,
         )
+
+
+class DA3SequentialPairMappingPipeline(DA3StreamingMappingPipeline):
+    """
+    A DA3-SLAM pipeline variant that runs DA3 on every sequential keyframe pair.
+
+    Differences vs. DA3StreamingMappingPipeline:
+    - DA3 jobs are always 2-keyframe chunks: [k-1, k].
+    - A new DA3 backend job is enqueued whenever optical flow yields a new keyframe.
+    - Existing frontend PnP/depth-projection logic is reused unchanged.
+    """
+
+    def __init__(
+        self,
+        flow_processor,
+        da3_client,
+        pose_graph_optimizer,
+        output_dir: str | Path,
+        optimizer_num_chunks: int = 5,
+        anchor_prior_weight: float = 1e6,
+        save_depth_png_preview: bool = True,
+        enable_frontend_pnp: bool = True,
+        pnp_min_inliers: int = 12,
+        pnp_reprojection_error_px: float = 4.0,
+        projected_depth_splat_radius: int = 1,
+        projected_depth_min_valid_pixels: int = 64,
+        backend_queue_size: int = 16,
+    ):
+        if backend_queue_size < 1:
+            raise ValueError("backend_queue_size must be >= 1")
+
+        super().__init__(
+            flow_processor=flow_processor,
+            da3_client=da3_client,
+            pose_graph_optimizer=pose_graph_optimizer,
+            output_dir=output_dir,
+            window_size=2,
+            da3_stride_new_keyframes=1,
+            optimizer_num_chunks=optimizer_num_chunks,
+            anchor_prior_weight=anchor_prior_weight,
+            save_depth_png_preview=save_depth_png_preview,
+            enable_frontend_pnp=enable_frontend_pnp,
+            pnp_min_inliers=pnp_min_inliers,
+            pnp_reprojection_error_px=pnp_reprojection_error_px,
+            projected_depth_splat_radius=projected_depth_splat_radius,
+            projected_depth_min_valid_pixels=projected_depth_min_valid_pixels,
+        )
+        self.backend_job_queue = queue.Queue(maxsize=int(backend_queue_size))
+
+    def _should_run_da3(self) -> bool:
+        with self.state_lock:
+            return len(self.sliding_keyframe_ids) >= 2
+
+    def _schedule_da3_on_current_window(self) -> Optional[int]:
+        with self.state_lock:
+            if len(self.sliding_keyframe_ids) < 2:
+                return None
+
+            image_ids = list(self.sliding_keyframe_ids)[-2:]
+            chunk_id = self.next_chunk_id
+            images = [self.keyframes[i].image_bgr.copy() for i in image_ids]
+            self.next_chunk_id += 1
+            self.new_keyframes_since_last_da3 = 0
+
+        job = DA3BackendJob(
+            chunk_id=chunk_id,
+            image_ids=image_ids,
+            images_bgr=images,
+        )
+
+        try:
+            self.backend_job_queue.put_nowait(job)
+        except queue.Full:
+            logger.warning(
+                "Skipping DA3 pair chunk %s for keyframes %s because backend queue is full.",
+                chunk_id,
+                image_ids,
+            )
+            return None
+
+        return chunk_id
