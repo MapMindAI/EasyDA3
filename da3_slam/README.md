@@ -12,7 +12,7 @@ From repo root:
 pip install -r requirement.txt
 ```
 
-Start Triton server (from EasyTensorRT project):
+Start Triton server (from EasyTensorRT project in https://github.com/MapMindAI/EasyTensorRT/tree/ly_da3_pair):
 
 ```bash
 ./run_server_trt.sh
