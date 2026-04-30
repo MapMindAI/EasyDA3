@@ -146,7 +146,7 @@ def main() -> None:
 
     import glob
 
-    image_files = glob.glob("data/office/*.png")
+    image_files = glob.glob("data/AmsterdamMorningDrive/*.jpg")
     image_files.sort()
 
     quit_requested = False
